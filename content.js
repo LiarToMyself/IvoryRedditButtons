@@ -1,6 +1,7 @@
 const WRAP_CLASS = 'author-btns-wrap';
 const POST_SELECTOR = 'shreddit-post, .thing.link';
-const STORAGE_KEY = 'ivory_reddit_blocked_v1';
+const BLOCKED_STORAGE_KEY = 'ivory_reddit_blocked_v1';
+const STATUS_STORAGE_KEY = 'ivory_reddit_author_status_v1';
 
 const BASE_BTN_STYLE =
   'position:relative;z-index:10;pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;height:26px;min-height:26px;max-height:26px;min-width:0;appearance:none;vertical-align:middle;gap:5px;margin:0;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:16px;text-decoration:none;white-space:nowrap;cursor:pointer;user-select:none;font-family:inherit;flex-shrink:0;transition:background 0.15s,border-color 0.15s,color 0.15s,opacity 0.15s;';
@@ -12,7 +13,7 @@ const NORMAL_THEME = {
   border: '#343536',
 };
 
-const ERROR_THEME = {
+const EMPTY_THEME = {
   bg: '#3b1d20',
   bgHover: '#4f262a',
   color: '#f5b7b1',
@@ -33,26 +34,43 @@ const BLOCKED_THEME = {
   border: '#2e523b',
 };
 
-const REQUEST_TIMEOUT_MS = 12000;
+const BADGE_STYLE =
+  'display:inline-block;padding:1px 5px;background:#6e2c33;color:#ffd7d5;border-radius:999px;font-size:10px;font-weight:700;line-height:13px;';
+
+const MAX_CONCURRENT = 2;
+const REQUEST_TIMEOUT_MS = 15000;
+const REQUEST_INTERVAL_MS = 500;
+const VIEWPORT_DWELL_MS = 180;
+const STATUS_TTL_MS = 10 * 60 * 1000;
+const FAILURE_TTL_MS = 60 * 1000;
+const MAX_CACHE_SIZE = 500;
+const PREFETCH_MARGIN_PX = 250;
 const BLOCK_COOLDOWN_MS = 1500;
 const ERROR_LOCK_MS = 2000;
-const DEFAULT_RATE_LIMIT_MS = 60 * 1000;
 const MIN_RATELIMIT_RESERVE = 5;
 
+const authorCache = new Map();
 const blockedAuthors = loadBlockedAuthors();
 const pendingBlocks = new Set();
 const authorErrors = new Map();
-const dimmedPosts = new WeakMap();
+const detachedWraps = new WeakSet();
+const dwellTimers = new WeakMap();
+const fetchQueue = [];
 
+let activeRequests = 0;
+let nextRequestAt = 0;
 let rateLimitedUntil = 0;
 let nextBlockAllowedAt = 0;
+let queueTimer = null;
 let cachedModhash = '';
 let modhashPromise = null;
 let blockChain = Promise.resolve();
 
+hydrateAuthorCacheFromSession();
+
 function loadBlockedAuthors() {
   try {
-    const raw = sessionStorage.getItem(STORAGE_KEY);
+    const raw = sessionStorage.getItem(BLOCKED_STORAGE_KEY);
     if (!raw) return new Set();
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? new Set(parsed.map((a) => String(a).toLowerCase())) : new Set();
@@ -63,9 +81,72 @@ function loadBlockedAuthors() {
 
 function saveBlockedAuthors() {
   try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify([...blockedAuthors]));
+    sessionStorage.setItem(BLOCKED_STORAGE_KEY, JSON.stringify([...blockedAuthors]));
   } catch {
-    // Ignore storage quota or privacy mode errors.
+    // Ignore storage errors in private mode or quota limits.
+  }
+}
+
+function hydrateAuthorCacheFromSession() {
+  try {
+    const raw = sessionStorage.getItem(STATUS_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return;
+    const now = Date.now();
+    for (const [key, val] of Object.entries(parsed)) {
+      if (
+        val &&
+        typeof val.expiresAt === 'number' &&
+        val.expiresAt > now &&
+        typeof val.hasHot === 'boolean' &&
+        typeof val.hasTop === 'boolean'
+      ) {
+        const status = {
+          hasHot: val.hasHot,
+          hotError: '',
+          hasTop: val.hasTop,
+          topError: '',
+          retryable: false,
+          retryAt: val.expiresAt,
+        };
+        authorCache.set(key, {
+          expiresAt: val.expiresAt,
+          hotPromise: Promise.resolve({ hasHot: val.hasHot, hotError: '', retryable: false }),
+          promise: Promise.resolve(status),
+          consumers: new Set(),
+          unscoped: false,
+          settledStatus: status,
+        });
+      }
+    }
+  } catch {
+    // Ignore malformed session cache.
+  }
+}
+
+function persistAuthorCacheToSession() {
+  try {
+    const now = Date.now();
+    const serializable = {};
+    for (const [key, entry] of authorCache.entries()) {
+      if (
+        entry.expiresAt !== Infinity &&
+        entry.expiresAt > now &&
+        entry.settledStatus &&
+        typeof entry.settledStatus.hasHot === 'boolean' &&
+        typeof entry.settledStatus.hasTop === 'boolean'
+      ) {
+        serializable[key] = {
+          hasHot: entry.settledStatus.hasHot,
+          hasTop: entry.settledStatus.hasTop,
+          expiresAt: entry.expiresAt,
+        };
+      }
+    }
+    sessionStorage.setItem(STATUS_STORAGE_KEY, JSON.stringify(serializable));
+  } catch {
+    // Ignore storage quota errors.
   }
 }
 
@@ -78,6 +159,48 @@ class RequestError extends Error {
   }
 }
 
+class CancelledCheck extends Error {}
+
+function enqueueRequest(task, priority = false, isRelevant = () => true) {
+  return new Promise((resolve, reject) => {
+    const entry = { task, resolve, reject, isRelevant };
+    if (priority) fetchQueue.unshift(entry);
+    else fetchQueue.push(entry);
+    processQueue();
+  });
+}
+
+function processQueue() {
+  if (queueTimer !== null) {
+    clearTimeout(queueTimer);
+    queueTimer = null;
+  }
+  for (let i = fetchQueue.length - 1; i >= 0; i--) {
+    if (!fetchQueue[i].isRelevant()) {
+      const [entry] = fetchQueue.splice(i, 1);
+      entry.reject(new CancelledCheck());
+    }
+  }
+  if (document.visibilityState === 'hidden' || pendingBlocks.size > 0) return;
+  if (activeRequests >= MAX_CONCURRENT || fetchQueue.length === 0) return;
+  const delay = Math.max(nextRequestAt, rateLimitedUntil) - Date.now();
+  if (delay > 0) {
+    queueTimer = setTimeout(processQueue, Math.min(delay, 2147483647));
+    return;
+  }
+  const { task, resolve, reject } = fetchQueue.shift();
+  activeRequests++;
+  nextRequestAt = Date.now() + REQUEST_INTERVAL_MS;
+  Promise.resolve()
+    .then(task)
+    .then(resolve, reject)
+    .finally(() => {
+      activeRequests--;
+      processQueue();
+    });
+  processQueue();
+}
+
 function respectRateLimit(res) {
   const now = Date.now();
   if (res.status === 429) {
@@ -86,7 +209,7 @@ function respectRateLimit(res) {
     const retryAt = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(value);
     rateLimitedUntil = Math.max(
       rateLimitedUntil,
-      Number.isFinite(retryAt) ? retryAt : now + DEFAULT_RATE_LIMIT_MS
+      Number.isFinite(retryAt) ? retryAt : now + FAILURE_TTL_MS
     );
   }
   const remaining = res.headers.get('X-Ratelimit-Remaining');
@@ -101,85 +224,89 @@ function respectRateLimit(res) {
   }
 }
 
-async function requestJson(url, options = {}) {
-  const now = Date.now();
-  if (rateLimitedUntil > now) {
-    const waitSec = Math.ceil((rateLimitedUntil - now) / 1000);
-    throw new RequestError(`Rate limited by Reddit. Wait ${waitSec}s.`, {
-      status: 429,
-      retryable: true,
-    });
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      ...options,
-      credentials: 'same-origin',
-      headers: { Accept: 'application/json', ...options.headers },
-      signal: controller.signal,
-    });
-    respectRateLimit(res);
-    if (!res.ok) {
-      const message =
-        res.status === 429
-          ? 'Reddit rate limit (HTTP 429). Wait before retrying.'
-          : res.status === 401 || res.status === 403
-            ? `Reddit denied access (HTTP ${res.status}). Check login session.`
-            : `Reddit returned HTTP ${res.status}.`;
-      throw new RequestError(message, {
-        status: res.status,
-        retryable: res.status === 429 || res.status >= 500,
-        uncertain: res.status >= 500,
+function requestJson(url, options = {}, priority = false, isRelevant = () => true) {
+  const task = async () => {
+    if (priority && rateLimitedUntil > Date.now()) {
+      const waitSec = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
+      throw new RequestError(`Reddit rate limit active. Please wait ${waitSec}s.`, {
+        status: 429,
+        retryable: true,
       });
     }
-    if (res.redirected) {
-      throw new RequestError('Reddit redirected the request. Check your session.', {
-        uncertain: true,
-      });
-    }
-    if (res.status === 204) return {};
-    const text = await res.text();
-    if (!text || !text.trim()) return {};
-    let data;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      data = JSON.parse(text);
-    } catch {
-      throw new RequestError('Reddit returned an unreadable response.', { uncertain: true });
-    }
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      throw new RequestError('Reddit returned an unexpected response.', { uncertain: true });
-    }
-    const errors = data.json?.errors ?? data.errors;
-    if (Array.isArray(errors) && errors.length) {
-      const details = errors
-        .map((err) => (Array.isArray(err) ? err.slice(0, 2).join(': ') : String(err)))
-        .join('; ');
-      const limited = errors.some((err) => Array.isArray(err) && err[0] === 'RATELIMIT');
-      if (limited) {
-        const seconds = Number(data.json?.ratelimit);
-        rateLimitedUntil = Math.max(
-          rateLimitedUntil,
-          Date.now() + (seconds > 0 ? seconds * 1000 : DEFAULT_RATE_LIMIT_MS)
-        );
+      const res = await fetch(url, {
+        ...options,
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json', ...options.headers },
+        signal: controller.signal,
+      });
+      respectRateLimit(res);
+      if (!res.ok) {
+        const message =
+          res.status === 429
+            ? 'Reddit rate limit. Please wait before retrying.'
+            : res.status === 401 || res.status === 403
+              ? `Reddit denied access (HTTP ${res.status}). Check that you are signed in.`
+              : `Reddit returned HTTP ${res.status}.`;
+        throw new RequestError(message, {
+          status: res.status,
+          retryable: res.status === 429 || res.status >= 500,
+          uncertain: res.status >= 500,
+        });
       }
-      throw new RequestError(details, { status: limited ? 429 : 0, retryable: limited });
+      if (res.redirected) {
+        throw new RequestError('Reddit redirected the request. Check your session.', {
+          uncertain: true,
+        });
+      }
+      if (options.method === 'POST' && res.status === 204) return {};
+      let data;
+      try {
+        data = await res.json();
+      } catch (error) {
+        if (controller.signal.aborted) throw error;
+        throw new RequestError('Reddit returned an unreadable response.', { uncertain: true });
+      }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new RequestError('Reddit returned an unexpected response.', { uncertain: true });
+      }
+      const errors = data.json?.errors ?? data.errors;
+      if (Array.isArray(errors) && errors.length) {
+        const details = errors
+          .map((error) => (Array.isArray(error) ? error.slice(0, 2).join(': ') : String(error)))
+          .join('; ');
+        const limited = errors.some((error) => Array.isArray(error) && error[0] === 'RATELIMIT');
+        if (limited) {
+          const seconds = Number(data.json?.ratelimit);
+          rateLimitedUntil = Math.max(
+            rateLimitedUntil,
+            Date.now() + (seconds > 0 ? seconds * 1000 : FAILURE_TTL_MS)
+          );
+        }
+        throw new RequestError(details, { status: limited ? 429 : 0, retryable: limited });
+      }
+      if (data.error || data.success === false) {
+        throw new RequestError(String(data.message || data.error || 'Reddit rejected the request.'));
+      }
+      return data;
+    } catch (error) {
+      if (error instanceof RequestError) throw error;
+      throw new RequestError(
+        controller.signal.aborted ? 'Reddit request timed out.' : 'Network error contacting Reddit.',
+        {
+          retryable: true,
+          uncertain: true,
+        }
+      );
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
     }
-    if (data.error || data.success === false) {
-      throw new RequestError(String(data.message || data.error || 'Reddit rejected the request.'));
-    }
-    return data;
-  } catch (error) {
-    if (error instanceof RequestError) throw error;
-    throw new RequestError(
-      controller.signal.aborted ? 'Reddit request timed out.' : 'Network error contacting Reddit.',
-      { retryable: true, uncertain: true }
-    );
-  } finally {
-    clearTimeout(timeout);
-    controller.abort();
-  }
+  };
+  if (!priority) return enqueueRequest(task, false, isRelevant);
+  return task();
 }
 
 function applyTheme(btn, theme) {
@@ -205,6 +332,22 @@ function bindHoverAndStopPropagation(btn) {
   });
 }
 
+function setEmptyState(btn, emptyText) {
+  btn.dataset.postsState = 'empty';
+  applyTheme(btn, EMPTY_THEME);
+  btn.textContent = '';
+
+  const badge = document.createElement('span');
+  badge.style.cssText = BADGE_STYLE;
+  badge.textContent = '✕';
+
+  const label = document.createElement('span');
+  label.textContent = emptyText;
+
+  btn.appendChild(badge);
+  btn.appendChild(label);
+}
+
 function createLinkBtn(text, url) {
   const fullUrl = new URL(url, location.origin).href;
   const btn = document.createElement('a');
@@ -215,11 +358,16 @@ function createLinkBtn(text, url) {
   btn.style.cssText = BASE_BTN_STYLE;
   applyTheme(btn, NORMAL_THEME);
   bindHoverAndStopPropagation(btn);
+  btn.dataset.postsState = 'unknown';
 
   const activate = (e) => {
     if (e.button !== 0 && e.button !== 1) return;
     e.stopPropagation();
     e.stopImmediatePropagation();
+    if (btn.dataset.postsState === 'empty') {
+      e.preventDefault();
+      return;
+    }
     const useCurrentTab =
       e.button === 0 &&
       !e.ctrlKey &&
@@ -251,29 +399,22 @@ function getDomToken() {
   const domUh = document.querySelector('input[name="uh"]')?.value;
   if (domUh) return domUh;
   const app = document.querySelector('shreddit-app');
-  const appToken =
-    app?.csrfToken || app?.getAttribute('csrf-token') || app?.getAttribute('spp') || '';
-  if (appToken) return appToken;
-  return '';
+  return app?.csrfToken || app?.getAttribute('csrf-token') || app?.getAttribute('spp') || '';
 }
 
-async function getModhash(forceRefresh = false) {
-  if (!forceRefresh) {
-    const domUh = document.querySelector('input[name="uh"]')?.value;
-    if (domUh) return domUh;
-    if (cachedModhash) return cachedModhash;
-  } else {
-    cachedModhash = '';
-    modhashPromise = null;
-  }
+async function getModhash() {
+  const domUh = document.querySelector('input[name="uh"]')?.value;
+  if (domUh) return domUh;
+  if (cachedModhash) return cachedModhash;
 
   if (!modhashPromise) {
-    modhashPromise = requestJson(`${location.origin}/api/me.json`)
+    modhashPromise = requestJson(`${location.origin}/api/me.json`, {}, true)
       .then((d) => {
         const uh = d?.data?.modhash || '';
         if (uh) cachedModhash = uh;
         return uh;
       })
+      .catch(() => '')
       .finally(() => {
         modhashPromise = null;
       });
@@ -281,12 +422,19 @@ async function getModhash(forceRefresh = false) {
   return modhashPromise;
 }
 
-async function resolveAccountIdFallback(author) {
-  const profile = await requestJson(
-    `${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`
-  );
-  const id = profile?.data?.id;
-  return typeof id === 'string' && /^[a-z0-9]+$/i.test(id) ? `t2_${id}` : '';
+async function resolveAccountId(author, initialId) {
+  if (/^t2_[a-z0-9]+$/i.test(initialId || '')) return initialId;
+  try {
+    const profile = await requestJson(
+      `${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`,
+      {},
+      true
+    );
+    const id = profile?.data?.id;
+    return typeof id === 'string' && /^[a-z0-9]+$/i.test(id) ? `t2_${id}` : '';
+  } catch {
+    return '';
+  }
 }
 
 async function sendBlockPost(author, accountId, uh, csrfToken) {
@@ -302,34 +450,33 @@ async function sendBlockPost(author, accountId, uh, csrfToken) {
   if (uh) headers['X-Modhash'] = uh;
   if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
 
-  await requestJson(`${location.origin}/api/block_user`, {
-    method: 'POST',
-    headers,
-    body: params.toString(),
-  });
+  await requestJson(
+    `${location.origin}/api/block_user`,
+    {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers,
+      body: params.toString(),
+    },
+    true
+  );
 }
 
 async function blockAccountRequest(author, authorId) {
   const csrfToken = getCsrfCookie() || getDomToken();
-  let uh = '';
-  try {
-    uh = await getModhash(false);
-  } catch (err) {
-    if (!csrfToken) throw err;
-  }
-  if (!uh && !csrfToken) {
-    throw new RequestError('Not logged in (missing session token).');
-  }
-
   const validInitialId = /^t2_[a-z0-9]+$/i.test(authorId || '') ? authorId : '';
+  const uh = await getModhash();
+
+  if (!uh && !csrfToken) {
+    throw new RequestError('No modhash or session token (check that you are logged in).');
+  }
 
   try {
     await sendBlockPost(author, validInitialId, uh, csrfToken);
   } catch (firstErr) {
     if (firstErr.status === 429) throw firstErr;
-    // Fallback only if post card had no author-id and Reddit required account_id.
     if (!validInitialId) {
-      const resolvedId = await resolveAccountIdFallback(author);
+      const resolvedId = await resolveAccountId(author, '');
       if (resolvedId) {
         await sendBlockPost(author, resolvedId, uh, csrfToken);
         return;
@@ -356,67 +503,64 @@ function enqueueBlockTask(fn) {
   return taskPromise;
 }
 
-function setBtnLabel(btn, iconText, labelText) {
+function markAuthorBlockedInDom(author) {
+  blockedAuthors.add(author.toLowerCase());
+  saveBlockedAuthors();
+  updateBlockButtons(author);
+}
+
+function setBlockBtnContent(btn, iconText, labelText) {
   btn.textContent = '';
-  if (iconText) {
-    const icon = document.createElement('span');
-    icon.textContent = iconText;
-    icon.style.cssText = 'font-size:12px;line-height:1;';
-    btn.appendChild(icon);
-  }
+  const icon = document.createElement('span');
+  icon.textContent = iconText;
+  icon.style.cssText = 'font-size:12px;line-height:1;';
   const label = document.createElement('span');
   label.textContent = labelText;
+  btn.appendChild(icon);
   btn.appendChild(label);
 }
 
-function renderBlockButton(btn, author) {
+function renderBlockButton(btn, author, error = null) {
   const key = author.toLowerCase();
-  const error = authorErrors.get(key) || null;
+  const activeError = error || authorErrors.get(key) || null;
   btn.title = '';
   btn.removeAttribute('aria-label');
 
   if (blockedAuthors.has(key)) {
     applyTheme(btn, BLOCKED_THEME);
-    setBtnLabel(btn, '✓', 'Blocked');
+    btn.textContent = '✓ Blocked';
     btn.style.cursor = 'default';
     btn.disabled = true;
-    return;
-  }
-
-  if (pendingBlocks.has(key)) {
+  } else if (pendingBlocks.has(key)) {
     applyTheme(btn, BLOCK_THEME);
-    setBtnLabel(btn, '⋯', 'Blocking');
-    btn.title = 'Sending block request to Reddit...';
+    setBlockBtnContent(btn, '⋯', 'Blocking');
+    btn.title = 'Waiting for Reddit to confirm the block.';
     btn.style.cursor = 'wait';
     btn.disabled = true;
-    return;
-  }
-
-  if (error) {
-    applyTheme(btn, ERROR_THEME);
+  } else if (activeError) {
     const isLocked = btn.dataset.errorLocked === 'true';
-    setBtnLabel(btn, '✕', isLocked ? 'Wait...' : 'Retry block');
-    btn.title = `${error.message}${
-      error.uncertain ? ' Check blocked accounts in Reddit settings before retrying.' : ''
+    applyTheme(btn, EMPTY_THEME);
+    setBlockBtnContent(btn, '✕', isLocked ? 'Wait...' : 'Retry block');
+    btn.title = `${activeError.message}${
+      activeError.uncertain ? ' Check blocked accounts in Reddit settings before retrying.' : ''
     }`;
     btn.setAttribute('aria-label', btn.title);
     btn.disabled = isLocked;
     btn.style.cursor = isLocked ? 'not-allowed' : 'pointer';
-    return;
+  } else {
+    btn.disabled = false;
+    btn.style.cursor = 'pointer';
+    applyTheme(btn, BLOCK_THEME);
+    setBlockBtnContent(btn, '⊘', 'Block');
   }
-
-  btn.disabled = false;
-  btn.style.cursor = 'pointer';
-  applyTheme(btn, BLOCK_THEME);
-  setBtnLabel(btn, '⊘', 'Block');
 }
 
-function updateBlockButtons(author) {
+function updateBlockButtons(author, error = null) {
   const key = author.toLowerCase();
   document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
     if ((wrap.dataset.author || '').toLowerCase() !== key) return;
     const blockBtn = wrap.querySelector('[data-role="block"]');
-    if (blockBtn) renderBlockButton(blockBtn, author);
+    if (blockBtn) renderBlockButton(blockBtn, author, error);
     const post = wrap.closest(POST_SELECTOR);
     if (post && blockedAuthors.has(key)) {
       dimPost(post);
@@ -462,33 +606,250 @@ function createBlockBtn(author, authorId) {
     authorErrors.delete(key);
     pendingBlocks.add(key);
     updateBlockButtons(author);
+    processQueue();
 
+    let failure = null;
     try {
       await enqueueBlockTask(() => blockAccountRequest(author, authorId));
-      blockedAuthors.add(key);
-      saveBlockedAuthors();
+      markAuthorBlockedInDom(author);
     } catch (error) {
+      failure = error;
       authorErrors.set(key, error);
       if (error.status === 401 || error.status === 403) {
         cachedModhash = '';
       }
     } finally {
       pendingBlocks.delete(key);
-      if (authorErrors.has(key)) {
-        const err = authorErrors.get(key);
+      if (failure) {
         const lockMs =
-          err.status === 429
+          failure.status === 429
             ? Math.min(Math.max(rateLimitedUntil - Date.now(), ERROR_LOCK_MS), 15000)
             : ERROR_LOCK_MS;
         lockAuthorButtonsTemporarily(author, lockMs);
       } else {
-        updateBlockButtons(author);
+        updateBlockButtons(author, null);
       }
+      processQueue();
     }
   });
 
   return btn;
 }
+
+async function checkListingHasPosts(url, priority = false, isRelevant = () => true) {
+  const data = await requestJson(url, {}, priority, isRelevant);
+  const children = data?.data?.children;
+  if (data?.kind !== 'Listing' || !Array.isArray(children)) {
+    throw new RequestError('Reddit returned an invalid post listing.');
+  }
+
+  return children.length > 0;
+}
+
+function getAuthorStatus(author, onHot, isRelevant = null) {
+  const key = author.toLowerCase();
+  const cached = authorCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    if (cached.expiresAt === Infinity) {
+      if (isRelevant) cached.consumers.add(isRelevant);
+      else cached.unscoped = true;
+    }
+    if (onHot) {
+      cached.hotPromise.then((hot) => {
+        if (!hot.cancelled) onHot(hot);
+      });
+    }
+    return cached.promise;
+  }
+
+  const encoded = encodeURIComponent(author);
+  const entry = {
+    expiresAt: Infinity,
+    hotPromise: null,
+    promise: null,
+    consumers: new Set(isRelevant ? [isRelevant] : []),
+    unscoped: !isRelevant,
+    settledStatus: null,
+  };
+  const needed = () =>
+    !blockedAuthors.has(key) && (entry.unscoped || [...entry.consumers].some((check) => check()));
+
+  entry.hotPromise = checkListingHasPosts(
+    `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=hot&include_over_18=on&raw_json=1`,
+    false,
+    needed
+  ).then(
+    (value) => ({ hasHot: value, hotError: '', retryable: false }),
+    (error) =>
+      error instanceof CancelledCheck
+        ? { cancelled: true }
+        : {
+            hasHot: null,
+            hotError: error.message,
+            retryable: error.retryable,
+          }
+  );
+
+  if (onHot) {
+    entry.hotPromise.then((hot) => {
+      if (!hot.cancelled) onHot(hot);
+    });
+  }
+
+  entry.promise = entry.hotPromise
+    .then(async (hot) => {
+      if (hot.cancelled) return hot;
+      let top;
+      if (hot.hasHot === true) {
+        // A visible submitted post also belongs to the all-time top listing.
+        top = { hasTop: true, topError: '', retryable: false };
+      } else {
+        try {
+          top = {
+            hasTop: await checkListingHasPosts(
+              `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=top&t=all&include_over_18=on&raw_json=1`,
+              false,
+              needed
+            ),
+            topError: '',
+            retryable: false,
+          };
+        } catch (error) {
+          if (error instanceof CancelledCheck) return { cancelled: true };
+          top = { hasTop: null, topError: error.message, retryable: error.retryable };
+        }
+      }
+      const failed = hot.hasHot === null || top.hasTop === null;
+      entry.expiresAt = Math.max(
+        Date.now() + (failed ? FAILURE_TTL_MS : STATUS_TTL_MS),
+        failed ? rateLimitedUntil : 0
+      );
+      for (const [oldKey, oldEntry] of authorCache) {
+        if (authorCache.size <= MAX_CACHE_SIZE) break;
+        if (oldEntry.expiresAt !== Infinity) authorCache.delete(oldKey);
+      }
+      const result = {
+        ...hot,
+        ...top,
+        retryable: hot.retryable || top.retryable,
+        retryAt: entry.expiresAt,
+      };
+      if (!failed) {
+        entry.settledStatus = result;
+        persistAuthorCacheToSession();
+      }
+      return result;
+    })
+    .then((status) => {
+      entry.consumers.clear();
+      if (status.cancelled && authorCache.get(key) === entry) authorCache.delete(key);
+      return status;
+    });
+
+  authorCache.set(key, entry);
+  return entry.promise;
+}
+
+function renderListingState(btn, hasPosts, label, emptyLabel, error) {
+  if (!btn) return;
+  btn.dataset.postsState = hasPosts === null ? 'unknown' : hasPosts ? 'present' : 'empty';
+  btn.title = hasPosts === null ? `Could not check posts: ${error}` : '';
+  if (hasPosts === false) setEmptyState(btn, emptyLabel);
+  else {
+    applyTheme(btn, NORMAL_THEME);
+    btn.textContent = label;
+  }
+}
+
+async function updateAuthorStatus(wrap, canRetry = true) {
+  const author = wrap.dataset.author;
+  if (!author || blockedAuthors.has(author.toLowerCase())) return;
+  if (wrap.dataset.statusChecking === 'true') return;
+  wrap.dataset.statusChecking = 'true';
+  const postsBtn = wrap.querySelector('[data-role="posts"]');
+  const topBtn = wrap.querySelector('[data-role="top"]');
+  let cancelled = false;
+  try {
+    const status = await getAuthorStatus(
+      author,
+      (hot) => {
+        if (wrap.isConnected && wrap.dataset.author === author) {
+          renderListingState(postsBtn, hot.hasHot, 'Posts', 'No posts', hot.hotError);
+        }
+      },
+      () => wrap.isConnected && wrap.dataset.author === author && wrap.dataset.nearby === 'true'
+    );
+    if (status.cancelled) {
+      cancelled = true;
+      return;
+    }
+    if (!wrap.isConnected || wrap.dataset.author !== author) return;
+    renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError);
+    renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.topError);
+    if (canRetry && status.retryable && wrap.dataset.statusRetry !== 'true') {
+      wrap.dataset.statusRetry = 'true';
+      setTimeout(() => {
+        if (wrap.isConnected && wrap.dataset.author === author) {
+          wrap.dataset.retryReady = 'true';
+          requestVisibleStatus(wrap);
+        }
+      }, Math.min(Math.max(status.retryAt - Date.now(), 0) + 1, 2147483647));
+    }
+  } finally {
+    wrap.dataset.statusChecking = 'false';
+    if (cancelled) {
+      wrap.dataset.statusRequested = 'false';
+      requestVisibleStatus(wrap);
+    }
+  }
+}
+
+function requestVisibleStatus(wrap) {
+  if (!wrap.isConnected || document.visibilityState === 'hidden' || wrap.dataset.nearby !== 'true')
+    return;
+  if (blockedAuthors.has((wrap.dataset.author || '').toLowerCase())) return;
+  if (wrap.dataset.statusChecking === 'true') return;
+  if (wrap.dataset.statusRequested === 'true' && wrap.dataset.retryReady !== 'true') return;
+  wrap.dataset.statusRequested = 'true';
+  wrap.dataset.retryReady = 'false';
+  updateAuthorStatus(wrap, wrap.dataset.statusRetry !== 'true');
+}
+
+function clearDwellTimer(wrap) {
+  const timer = dwellTimers.get(wrap);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    dwellTimers.delete(wrap);
+  }
+}
+
+const visibilityObserver = new IntersectionObserver(
+  (entries) => {
+    entries.forEach((entry) => {
+      const wrap = entry.target;
+      wrap.dataset.nearby = String(entry.isIntersecting);
+      clearDwellTimer(wrap);
+
+      if (entry.isIntersecting) {
+        const key = (wrap.dataset.author || '').toLowerCase();
+        const cached = authorCache.get(key);
+        if (cached && cached.expiresAt > Date.now() && cached.expiresAt !== Infinity) {
+          requestVisibleStatus(wrap);
+        } else {
+          const timer = setTimeout(() => {
+            dwellTimers.delete(wrap);
+            if (wrap.isConnected && wrap.dataset.nearby === 'true') {
+              requestVisibleStatus(wrap);
+            }
+          }, VIEWPORT_DWELL_MS);
+          dwellTimers.set(wrap, timer);
+        }
+      }
+    });
+    processQueue();
+  },
+  { rootMargin: `${PREFETCH_MARGIN_PX}px` }
+);
 
 function normalizeAuthor(raw) {
   if (!raw) return '';
@@ -525,8 +886,45 @@ function createBtnGroup(author, authorId) {
   wrap.appendChild(topBtn);
   wrap.appendChild(blockBtn);
 
+  // Immediately apply cached state if already known from sessionStorage or memory.
+  const cached = authorCache.get(author.toLowerCase());
+  if (cached && cached.settledStatus && cached.expiresAt > Date.now()) {
+    renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
+    renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
+    wrap.dataset.statusRequested = 'true';
+  }
+
+  visibilityObserver.observe(wrap);
+
+  const checkOnIntent = () => {
+    clearDwellTimer(wrap);
+    if (wrap.dataset.statusChecking === 'true') return;
+    const entry = authorCache.get(author.toLowerCase());
+    if (wrap.dataset.statusRequested === 'true' && entry && entry.expiresAt > Date.now()) return;
+    wrap.dataset.statusRequested = 'true';
+    wrap.dataset.nearby = 'true';
+    updateAuthorStatus(wrap, false);
+  };
+  [postsBtn, topBtn].forEach((btn) => {
+    btn.addEventListener('pointerenter', checkOnIntent);
+    btn.addEventListener('focus', checkOnIntent);
+  });
   return wrap;
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
+      visibilityObserver.unobserve(wrap);
+      visibilityObserver.observe(wrap);
+    });
+  } else {
+    document.querySelectorAll(`.${WRAP_CLASS}`).forEach(clearDwellTimer);
+    processQueue();
+  }
+});
+
+const dimmedPosts = new WeakMap();
 
 function dimPost(post) {
   if (!dimmedPosts.has(post)) dimmedPosts.set(post, post.style.opacity);
@@ -538,24 +936,28 @@ function processPost(post) {
   const modern = post.matches('shreddit-post');
   const author = normalizeAuthor(post.getAttribute(modern ? 'author' : 'data-author'));
   const authorId = extractAuthorId(post, modern);
-
   if (dimmedPosts.has(post) && !blockedAuthors.has(author.toLowerCase())) {
     post.style.opacity = dimmedPosts.get(post);
     dimmedPosts.delete(post);
   }
-
   const existing = post.querySelector(`.${WRAP_CLASS}`);
   if (existing) {
     if (existing.dataset.author === author && existing.dataset.authorId === authorId) {
+      if (detachedWraps.has(existing)) {
+        detachedWraps.delete(existing);
+        visibilityObserver.observe(existing);
+      }
       return;
     }
+    clearDwellTimer(existing);
+    existing.dataset.nearby = 'false';
+    visibilityObserver.unobserve(existing);
     existing.remove();
+    processQueue();
   }
-
   if (!author || author === '[deleted]') return;
   const bar = post.querySelector(modern ? '[slot="credit-bar"]' : 'p.tagline');
   if (!bar) return;
-
   const wrap = createBtnGroup(author, authorId);
   if (modern) {
     post.style.isolation = 'isolate';
@@ -574,7 +976,6 @@ function processPost(post) {
   } else {
     bar.appendChild(wrap);
   }
-
   if (blockedAuthors.has(author.toLowerCase())) dimPost(post);
 }
 
@@ -590,6 +991,7 @@ function collectPosts(node) {
 }
 
 function scheduleProcessPosts(mutations) {
+  let detached = false;
   for (const mutation of mutations) {
     if (mutation.target.nodeType === 1 && mutation.target.closest(`.${WRAP_CLASS}`)) continue;
     if (mutation.type === 'attributes') {
@@ -600,7 +1002,20 @@ function scheduleProcessPosts(mutations) {
       mutation.target.nodeType === 1 ? mutation.target.closest(POST_SELECTOR) : null;
     if (parentPost) pendingPosts.add(parentPost);
     mutation.addedNodes.forEach(collectPosts);
+    mutation.removedNodes.forEach((node) => {
+      if (node.nodeType !== 1 || node.isConnected) return;
+      const detach = (wrap) => {
+        clearDwellTimer(wrap);
+        wrap.dataset.nearby = 'false';
+        visibilityObserver.unobserve(wrap);
+        detachedWraps.add(wrap);
+        detached = true;
+      };
+      if (node.matches(`.${WRAP_CLASS}`)) detach(node);
+      node.querySelectorAll(`.${WRAP_CLASS}`).forEach(detach);
+    });
   }
+  if (detached) processQueue();
   if (rafScheduled || pendingPosts.size === 0) return;
   rafScheduled = true;
   requestAnimationFrame(() => {
