@@ -13,3 +13,7 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Build and runtime artifacts
+artifacts/
+logs/
+screenshots/
