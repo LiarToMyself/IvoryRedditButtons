@@ -40,10 +40,12 @@ const BADGE_STYLE =
 
 const MAX_CONCURRENT = 1;
 const REQUEST_TIMEOUT_MS = 15000;
-const REQUEST_INTERVAL_MS = 800;
-const VIEWPORT_DWELL_MS = 350;
+const REQUEST_INTERVAL_MS = 2500;
+const PRIORITY_INTERVAL_MS = 300;
+const VIEWPORT_DWELL_MS = 1000;
 const STATUS_TTL_MS = 30 * 60 * 1000;
 const FAILURE_TTL_MS = 60 * 1000;
+const RATE_LIMIT_FALLBACK_MS = 10 * 60 * 1000;
 const MAX_CACHE_SIZE = 500;
 const PREFETCH_MARGIN_PX = 120;
 const BLOCK_COOLDOWN_MS = 1500;
@@ -51,6 +53,7 @@ const ERROR_LOCK_MS = 2000;
 const BG_RATELIMIT_RESERVE = 25;
 const MIN_RATELIMIT_RESERVE = 5;
 const PERSIST_DEBOUNCE_MS = 500;
+const LAST_REQ_STORAGE_KEY = 'ivory_reddit_last_req_v1';
 
 const authorCache = new Map();
 const blockedAuthors = loadBlockedAuthors();
@@ -161,32 +164,14 @@ function applyHydratedAuthorRecord(key, val, now) {
       retryable: false,
       retryAt: val.expiresAt,
     };
-    const hotObj = { hasHot: val.hasHot, hotError: '', retryable: false };
     authorCache.set(key, {
       expiresAt: val.expiresAt,
-      hotResult: hotObj,
-      hotPromise: Promise.resolve(hotObj),
       promise: Promise.resolve(status),
       consumers: new Set(),
       unscoped: false,
       priority: false,
       settledStatus: status,
     });
-  } else if (typeof val.hasHot === 'boolean') {
-    const hotObj = { hasHot: val.hasHot, hotError: '', retryable: false };
-    const existing = authorCache.get(key);
-    if (!existing || !existing.settledStatus) {
-      authorCache.set(key, {
-        expiresAt: val.expiresAt,
-        hotResult: hotObj,
-        hotPromise: Promise.resolve(hotObj),
-        promise: null,
-        consumers: new Set(),
-        unscoped: false,
-        priority: false,
-        settledStatus: null,
-      });
-    }
   }
 }
 
@@ -232,16 +217,6 @@ function persistAuthorCacheToSession() {
           hasTop: entry.settledStatus.hasTop,
           expiresAt: entry.expiresAt,
         };
-      } else if (
-        entry.expiresAt !== Infinity &&
-        entry.expiresAt > now &&
-        entry.hotResult &&
-        typeof entry.hotResult.hasHot === 'boolean'
-      ) {
-        serializable[key] = {
-          hasHot: entry.hotResult.hasHot,
-          expiresAt: entry.expiresAt,
-        };
       }
     }
     writeStorageItem(STATUS_STORAGE_KEY, JSON.stringify(serializable));
@@ -269,20 +244,26 @@ class RequestError extends Error {
 
 class CancelledCheck extends Error {}
 
-function getAdaptiveIntervalMs(isPriorityOrContinuation) {
-  if (isPriorityOrContinuation) return Math.min(REQUEST_INTERVAL_MS, 400);
+function getAdaptiveIntervalMs(isPriority) {
+  if (isPriority) return PRIORITY_INTERVAL_MS;
   if (lastRateLimitRemaining !== null && Number.isFinite(lastRateLimitRemaining)) {
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 10) return 1600;
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 25) return 1200;
+    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 10) return 4000;
+    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 25) return 3000;
   }
   return REQUEST_INTERVAL_MS;
 }
 
 function getEntryBlockedUntil(entry) {
-  if (entry.continuation || entry.priority) {
-    return Math.max(nextRequestAt, rateLimitedUntil, hoverPausedUntil);
+  const lastGlobalRaw = readStorageItem(LAST_REQ_STORAGE_KEY);
+  const lastGlobal = lastGlobalRaw ? Number(lastGlobalRaw) : 0;
+  const interval = getAdaptiveIntervalMs(entry.priority);
+  const globalNextAt = Number.isFinite(lastGlobal) && lastGlobal > 0 ? lastGlobal + interval : 0;
+  const effectiveNextAt = Math.max(nextRequestAt, globalNextAt);
+
+  if (entry.priority) {
+    return Math.max(effectiveNextAt, rateLimitedUntil, hoverPausedUntil);
   }
-  return Math.max(nextRequestAt, rateLimitedUntil, bgPausedUntil);
+  return Math.max(effectiveNextAt, rateLimitedUntil, bgPausedUntil);
 }
 
 function enqueueRequest(task, priority = false, isRelevant = () => true, meta = {}) {
@@ -293,10 +274,9 @@ function enqueueRequest(task, priority = false, isRelevant = () => true, meta = 
       reject,
       isRelevant,
       priority: Boolean(priority),
-      continuation: Boolean(meta.continuation),
       authorKey: meta.authorKey ? String(meta.authorKey).toLowerCase() : '',
     };
-    if (entry.continuation || entry.priority) {
+    if (entry.priority) {
       fetchQueue.unshift(entry);
     } else {
       fetchQueue.push(entry);
@@ -357,7 +337,9 @@ function processQueue() {
 
   const [entry] = fetchQueue.splice(runnableIndex, 1);
   activeRequests++;
-  nextRequestAt = Date.now() + getAdaptiveIntervalMs(entry.priority || entry.continuation);
+  const interval = getAdaptiveIntervalMs(entry.priority);
+  nextRequestAt = Date.now() + interval;
+  writeStorageItem(LAST_REQ_STORAGE_KEY, String(Date.now()));
   Promise.resolve()
     .then(entry.task)
     .then(entry.resolve, entry.reject)
@@ -368,35 +350,42 @@ function processQueue() {
   processQueue();
 }
 
+function parseHeaderNumber(val) {
+  if (!val) return NaN;
+  const parts = String(val)
+    .split(',')
+    .map((s) => parseFloat(s.trim()))
+    .filter((n) => Number.isFinite(n));
+  if (parts.length === 0) return NaN;
+  return Math.min(...parts);
+}
+
 function respectRateLimit(res) {
   const now = Date.now();
   let changed = false;
   if (res.status === 429) {
     const value = res.headers.get('Retry-After');
-    const seconds = value === null ? NaN : Number(value);
+    const seconds = parseHeaderNumber(value);
     const retryAt = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(value);
     rateLimitedUntil = Math.max(
       rateLimitedUntil,
-      Number.isFinite(retryAt) ? retryAt : now + FAILURE_TTL_MS
+      Number.isFinite(retryAt) ? retryAt : now + RATE_LIMIT_FALLBACK_MS
     );
     changed = true;
   }
-  const remainingRaw = res.headers.get('X-Ratelimit-Remaining');
-  const reset = Number(res.headers.get('X-Ratelimit-Reset'));
-  if (remainingRaw !== null) {
-    const remaining = Number(remainingRaw);
-    if (Number.isFinite(remaining)) {
-      lastRateLimitRemaining = remaining;
-      if (Number.isFinite(reset) && reset > 0) {
-        const resetAt = now + reset * 1000;
-        if (remaining <= BG_RATELIMIT_RESERVE) {
-          bgPausedUntil = Math.max(bgPausedUntil, resetAt);
-          changed = true;
-        }
-        if (remaining <= MIN_RATELIMIT_RESERVE) {
-          hoverPausedUntil = Math.max(hoverPausedUntil, resetAt);
-          changed = true;
-        }
+  const remaining = parseHeaderNumber(res.headers.get('X-Ratelimit-Remaining'));
+  const reset = parseHeaderNumber(res.headers.get('X-Ratelimit-Reset'));
+  if (Number.isFinite(remaining)) {
+    lastRateLimitRemaining = remaining;
+    if (Number.isFinite(reset) && reset > 0) {
+      const resetAt = now + reset * 1000;
+      if (remaining <= BG_RATELIMIT_RESERVE) {
+        bgPausedUntil = Math.max(bgPausedUntil, resetAt);
+        changed = true;
+      }
+      if (remaining <= MIN_RATELIMIT_RESERVE) {
+        hoverPausedUntil = Math.max(hoverPausedUntil, resetAt);
+        changed = true;
       }
     }
   }
@@ -850,17 +839,12 @@ function syncAuthorListingButtonsInDom(author, status) {
   });
 }
 
-function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
+function getAuthorStatus(author, isRelevant = null, priority = false) {
   const key = author.toLowerCase();
   const cached = authorCache.get(key);
   const now = Date.now();
 
   if (cached && cached.settledStatus && cached.expiresAt > now) {
-    if (onHot) {
-      Promise.resolve(cached.settledStatus).then((hot) => {
-        if (!hot.cancelled) onHot(hot);
-      });
-    }
     return cached.promise;
   }
 
@@ -871,33 +855,16 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
       cached.priority = true;
       promoteAuthorInQueue(key);
     }
-    if (onHot && cached.hotPromise) {
-      cached.hotPromise.then((hot) => {
-        if (!hot.cancelled) onHot(hot);
-      });
-    }
     return cached.promise;
   }
 
-  if (cached && !cached.settledStatus && !cached.hotResult && cached.expiresAt > now && !priority) {
-    if (onHot && cached.hotPromise) {
-      cached.hotPromise.then((hot) => {
-        if (!hot.cancelled) onHot(hot);
-      });
-    }
+  if (cached && !cached.settledStatus && cached.expiresAt > now && !priority) {
     if (cached.promise) return cached.promise;
   }
 
   const encoded = encodeURIComponent(author);
-  const preservedHot =
-    cached && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean'
-      ? cached.hotResult
-      : null;
-
   const entry = {
     expiresAt: Infinity,
-    hotResult: preservedHot,
-    hotPromise: null,
     promise: null,
     consumers: new Set(isRelevant ? [isRelevant] : []),
     unscoped: !isRelevant,
@@ -907,79 +874,60 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
   const needed = () =>
     !blockedAuthors.has(key) && (entry.unscoped || [...entry.consumers].some((check) => check()));
 
-  if (preservedHot) {
-    entry.hotPromise = Promise.resolve(preservedHot);
-  } else {
-    entry.hotPromise = checkListingHasPosts(
-      `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=hot&include_over_18=on&raw_json=1`,
-      entry.priority,
-      needed,
-      { authorKey: key, priorityQueue: entry.priority }
-    ).then(
-      (value) => {
-        const res = { hasHot: value, hotError: '', retryable: false };
-        entry.hotResult = res;
-        syncAuthorListingButtonsInDom(author, { hasHot: value, hotError: '' });
-        return res;
-      },
+  entry.promise = checkListingHasPosts(
+    `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=hot&include_over_18=on&raw_json=1`,
+    entry.priority,
+    needed,
+    { authorKey: key, priorityQueue: entry.priority }
+  )
+    .then(
+      (hasPosts) => ({
+        hasHot: hasPosts,
+        hotError: '',
+        hasTop: hasPosts,
+        topError: '',
+        retryable: false,
+      }),
       (error) => {
-        if (error instanceof CancelledCheck) return { cancelled: true };
+        if (error instanceof CancelledCheck) {
+          return { cancelled: true };
+        }
         if (error instanceof RequestError && error.status === 404) {
-          const res404 = { hasHot: false, hotError: '', retryable: false, emptyProfile: true };
-          entry.hotResult = res404;
-          syncAuthorListingButtonsInDom(author, { hasHot: false, hotError: '' });
-          return res404;
+          return {
+            hasHot: false,
+            hotError: 'Profile not found (404)',
+            hasTop: false,
+            topError: 'Profile not found (404)',
+            retryable: false,
+          };
+        }
+        if (error instanceof RequestError && error.status === 403) {
+          return {
+            hasHot: null,
+            hotError: 'Account suspended or restricted (403)',
+            hasTop: null,
+            topError: 'Account suspended or restricted (403)',
+            retryable: false,
+          };
         }
         return {
           hasHot: null,
           hotError: error.message,
-          retryable: error.retryable,
+          hasTop: null,
+          topError: error.message,
+          retryable: Boolean(error.retryable),
         };
       }
-    );
-  }
-
-  if (onHot) {
-    entry.hotPromise.then((hot) => {
-      if (!hot.cancelled) onHot(hot);
-    });
-  }
-
-  entry.promise = entry.hotPromise
-    .then(async (hot) => {
-      if (hot.cancelled) return hot;
-      let top;
-      if (hot.hasHot === true) {
-        // A visible submitted post also belongs to the all-time top listing.
-        top = { hasTop: true, topError: '', retryable: false };
-      } else if (hot.emptyProfile) {
-        top = { hasTop: false, topError: '', retryable: false };
-      } else if (hot.hasHot === null) {
-        top = { hasTop: null, topError: hot.hotError, retryable: hot.retryable };
-      } else {
-        try {
-          top = {
-            hasTop: await checkListingHasPosts(
-              `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=top&t=all&include_over_18=on&raw_json=1`,
-              true,
-              needed,
-              { authorKey: key, priorityQueue: true, continuation: true }
-            ),
-            topError: '',
-            retryable: false,
-          };
-        } catch (error) {
-          if (error instanceof CancelledCheck) {
-            return { cancelled: true, hotPreserved: true, hasHot: hot.hasHot, hotError: '' };
-          }
-          if (error instanceof RequestError && error.status === 404) {
-            top = { hasTop: false, topError: '', retryable: false };
-          } else {
-            top = { hasTop: null, topError: error.message, retryable: error.retryable };
-          }
+    )
+    .then((status) => {
+      entry.consumers.clear();
+      if (status.cancelled) {
+        if (authorCache.get(key) === entry) {
+          authorCache.delete(key);
         }
+        return status;
       }
-      const failed = hot.hasHot === null || top.hasTop === null;
+      const failed = status.hasHot === null || status.hasTop === null;
       entry.expiresAt = Math.max(
         Date.now() + (failed ? FAILURE_TTL_MS : STATUS_TTL_MS),
         failed ? rateLimitedUntil : 0
@@ -989,35 +937,19 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
         if (oldEntry.expiresAt !== Infinity) authorCache.delete(oldKey);
       }
       const result = {
-        hasHot: hot.hasHot,
-        hotError: hot.hotError || '',
-        hasTop: top.hasTop,
-        topError: top.topError || '',
-        retryable: Boolean(hot.retryable || top.retryable),
+        hasHot: status.hasHot,
+        hotError: status.hotError || '',
+        hasTop: status.hasTop,
+        topError: status.topError || '',
+        retryable: Boolean(status.retryable),
         retryAt: entry.expiresAt,
       };
       if (!failed) {
         entry.settledStatus = result;
         syncAuthorListingButtonsInDom(author, result);
         schedulePersistAuthorCache();
-      } else if (typeof hot.hasHot === 'boolean') {
-        syncAuthorListingButtonsInDom(author, { hasHot: hot.hasHot, hotError: '' });
-        schedulePersistAuthorCache();
       }
       return result;
-    })
-    .then((status) => {
-      entry.consumers.clear();
-      if (status.cancelled) {
-        if (entry.hotResult && typeof entry.hotResult.hasHot === 'boolean') {
-          entry.expiresAt = Date.now() + STATUS_TTL_MS;
-          entry.promise = null;
-          schedulePersistAuthorCache();
-        } else if (authorCache.get(key) === entry) {
-          authorCache.delete(key);
-        }
-      }
-      return status;
     });
 
   authorCache.set(key, entry);
@@ -1049,33 +981,16 @@ async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
   try {
     const status = await getAuthorStatus(
       author,
-      (hot) => {
-        if (wrap.isConnected && wrap.dataset.author === author) {
-          renderListingState(postsBtn, hot.hasHot, 'Posts', 'No posts', hot.hotError);
-        }
-      },
       () => wrap.isConnected && wrap.dataset.author === author && wrap.dataset.nearby === 'true',
       priority
     );
     if (status.cancelled) {
       cancelled = true;
-      if (typeof status.hasHot === 'boolean' && wrap.isConnected && wrap.dataset.author === author) {
-        renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError || '');
-      }
       return;
     }
     if (!wrap.isConnected || wrap.dataset.author !== author) return;
     renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError);
     renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.topError);
-    if (canRetry && status.retryable && wrap.dataset.statusRetry !== 'true') {
-      wrap.dataset.statusRetry = 'true';
-      setTimeout(() => {
-        if (wrap.isConnected && wrap.dataset.author === author) {
-          wrap.dataset.retryReady = 'true';
-          requestVisibleStatus(wrap);
-        }
-      }, Math.min(Math.max(status.retryAt - Date.now(), 0) + 1, 2147483647));
-    }
   } finally {
     wrap.dataset.statusChecking = 'false';
     if (cancelled) {
@@ -1100,13 +1015,7 @@ function requestVisibleStatus(wrap) {
     wrap.dataset.statusRequested = 'true';
     return;
   }
-  const hasIncompleteHot =
-    cached && !cached.settledStatus && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean';
-  if (
-    wrap.dataset.statusRequested === 'true' &&
-    wrap.dataset.retryReady !== 'true' &&
-    !hasIncompleteHot
-  ) {
+  if (wrap.dataset.statusRequested === 'true' && wrap.dataset.retryReady !== 'true') {
     return;
   }
   wrap.dataset.statusRequested = 'true';
@@ -1136,7 +1045,7 @@ const visibilityObserver = new IntersectionObserver(
           cached &&
           cached.expiresAt > Date.now() &&
           cached.expiresAt !== Infinity &&
-          (cached.settledStatus || cached.hotResult)
+          cached.settledStatus
         ) {
           requestVisibleStatus(wrap);
         } else {
@@ -1201,16 +1110,12 @@ function extractAuthorFromBar(post, bar) {
 
 function applyCachedAuthorStatusToWrap(wrap, author) {
   const cached = authorCache.get(author.toLowerCase());
-  if (!cached || cached.expiresAt <= Date.now()) return;
+  if (!cached || cached.expiresAt <= Date.now() || !cached.settledStatus) return;
   const postsBtn = wrap.querySelector('[data-role="posts"]');
   const topBtn = wrap.querySelector('[data-role="top"]');
-  if (cached.settledStatus) {
-    renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
-    renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
-    wrap.dataset.statusRequested = 'true';
-  } else if (cached.hotResult && typeof cached.hotResult.hasHot === 'boolean') {
-    renderListingState(postsBtn, cached.hotResult.hasHot, 'Posts', 'No posts', '');
-  }
+  renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
+  renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
+  wrap.dataset.statusRequested = 'true';
 }
 
 function createBtnGroup(author, authorId) {
@@ -1299,8 +1204,6 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
           const entry = authorCache.get(lower);
           if (entry?.settledStatus) {
             syncAuthorListingButtonsInDom(lower, entry.settledStatus);
-          } else if (entry?.hotResult) {
-            syncAuthorListingButtonsInDom(lower, entry.hotResult);
           }
         }
       } catch {
@@ -1357,7 +1260,10 @@ function processPost(post) {
 
   const existing = findOwnWrap(post);
   if (existing) {
-    if (existing.dataset.author === author && existing.dataset.authorId === authorId) {
+    if (existing.dataset.author === author) {
+      if (authorId && existing.dataset.authorId !== authorId) {
+        existing.dataset.authorId = authorId;
+      }
       applyCachedAuthorStatusToWrap(existing, author);
       if (detachedWraps.has(existing)) {
         detachedWraps.delete(existing);
