@@ -31,7 +31,7 @@ Lightweight Manifest V3 Chrome extension for Reddit (Shreddit and Old Reddit). A
 
 - `manifest.json` - Chrome Extension Manifest V3 configuration.
 - `content.js` - Content script for DOM button injection, empty-listing detection, and block API handling.
-- `plans/CHANGES-1.4.3-gemini.md` - Root-cause analysis and v1.4.3 changelog.
+- `plans/CHANGES-1.4.3-gemini-3.8FH.md` - Root-cause analysis and v1.4.3 changelog.
 - `plans/CHANGES-1.4.2-argon.md` - Root-cause analysis and v1.4.2 changelog (Issues #2, #3, #5, #6, #7, #8).
 - `plans/CHANGES-1.4-argon.md` - Historical analysis of v1.3.8 rate-limit bugs and v1.4.0 / v1.4.1 changes.
 - `CHANGES-1.3.md`, `CHANGES-1.2.md`, `REVIEW-2026-10-22.md` - Historical changelogs and audits from prior versions.

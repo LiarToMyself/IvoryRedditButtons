@@ -198,3 +198,8 @@ When the user corrects your approach, append a one-line rule here before ending 
 - Always respect Reddit API and HTML page rate limits: never spam unauthenticated requests or background fetch without strict backoff and rate-limit headers inspection.
 - Reddit user profile pages can be hidden, empty, or restricted by user privacy settings (e.g., hidden post history or NSFW/suspended accounts); handle 404, 403, and empty listings distinctly.
 - Never block the browser UI thread or cause HTTP 429 lockouts for the user across open tabs.
+- Cross-tab pacing must be globally enforced via localStorage timestamps to prevent multi-tab burst amplification on Reddit endpoints.
+- Parse Fastly/Envoy proxy headers defensively (split comma, parseFloat) to prevent NaN rate-limit bypasses.
+- Use a safe 600s fallback backoff on HTTP 429 when Retry-After is absent to avoid resetting Reddit's penalty timer.
+- Query author submissions atomically (a single request accurately determines both hot and top emptiness, eliminating two-phase race conditions).
+- Never remove and recreate button containers during asynchronous <shreddit-post> author-id hydration; update dataset attributes in-place.
