@@ -8,6 +8,8 @@ Thumbs.db
 .idea/
 .vscode/
 
+artifacts/
+
 # Environments and secrets
 .env
 .env.*

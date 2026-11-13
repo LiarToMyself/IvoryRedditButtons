@@ -40,16 +40,23 @@ const BADGE_STYLE =
 
 const MAX_CONCURRENT = 1;
 const REQUEST_TIMEOUT_MS = 15000;
-const REQUEST_INTERVAL_MS = 800;
-const VIEWPORT_DWELL_MS = 350;
-const STATUS_TTL_MS = 30 * 60 * 1000;
+const REQUEST_INTERVAL_MS = 2200;
+const PRIORITY_INTERVAL_MS = 1200;
+const VIEWPORT_DWELL_MS = 900;
+const STATUS_TTL_MS = 60 * 60 * 1000;
 const FAILURE_TTL_MS = 60 * 1000;
-const MAX_CACHE_SIZE = 500;
-const PREFETCH_MARGIN_PX = 120;
+const RATE_LIMIT_BASE_BACKOFF_MS = 5 * 60 * 1000;
+const RATE_LIMIT_MAX_BACKOFF_MS = 15 * 60 * 1000;
+const MAX_CACHE_SIZE = 1000;
+const PREFETCH_MARGIN_PX = 40;
 const BLOCK_COOLDOWN_MS = 1500;
 const ERROR_LOCK_MS = 2000;
 const BG_RATELIMIT_RESERVE = 25;
 const MIN_RATELIMIT_RESERVE = 5;
+const BG_WINDOW_SHORT_MS = 60 * 1000;
+const BG_MAX_PER_MIN = 10;
+const BG_WINDOW_LONG_MS = 10 * 60 * 1000;
+const BG_MAX_PER_10MIN = 45;
 const PERSIST_DEBOUNCE_MS = 500;
 
 const authorCache = new Map();
@@ -65,6 +72,9 @@ let nextRequestAt = 0;
 let rateLimitedUntil = 0;
 let bgPausedUntil = 0;
 let hoverPausedUntil = 0;
+let consecutive429s = 0;
+let recentBgTimestamps = [];
+let lastRateStateUpdatedAt = 0;
 let lastRateLimitRemaining = null;
 let nextBlockAllowedAt = 0;
 let queueTimer = null;
@@ -118,6 +128,14 @@ function saveBlockedAuthors() {
   writeStorageItem(BLOCKED_STORAGE_KEY, JSON.stringify([...blockedAuthors]));
 }
 
+function pruneRecentTimestamps(list, now = Date.now()) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((ts) => typeof ts === 'number' && Number.isFinite(ts) && ts > now - BG_WINDOW_LONG_MS)
+    .sort((a, b) => a - b)
+    .slice(-(BG_MAX_PER_10MIN + 20));
+}
+
 function hydrateRateLimitFromStorage() {
   try {
     const raw = readStorageItem(RATELIMIT_STORAGE_KEY);
@@ -134,18 +152,37 @@ function hydrateRateLimitFromStorage() {
     if (typeof parsed.hoverPausedUntil === 'number' && parsed.hoverPausedUntil > now) {
       hoverPausedUntil = Math.max(hoverPausedUntil, parsed.hoverPausedUntil);
     }
+    if (typeof parsed.nextRequestAt === 'number' && parsed.nextRequestAt > now) {
+      nextRequestAt = Math.max(nextRequestAt, parsed.nextRequestAt);
+    }
+    if (typeof parsed.updatedAt === 'number' && parsed.updatedAt >= lastRateStateUpdatedAt) {
+      lastRateStateUpdatedAt = parsed.updatedAt;
+      if (typeof parsed.consecutive429s === 'number' && parsed.consecutive429s >= 0) {
+        consecutive429s = parsed.consecutive429s;
+      }
+      if (Array.isArray(parsed.recentBgTimestamps)) {
+        recentBgTimestamps = pruneRecentTimestamps(parsed.recentBgTimestamps, now);
+      }
+    }
   } catch {
     // Ignore malformed rate-limit state.
   }
 }
 
 function persistRateLimitToStorage() {
+  const now = Date.now();
+  lastRateStateUpdatedAt = now;
+  recentBgTimestamps = pruneRecentTimestamps(recentBgTimestamps, now);
   writeStorageItem(
     RATELIMIT_STORAGE_KEY,
     JSON.stringify({
       rateLimitedUntil,
       bgPausedUntil,
       hoverPausedUntil,
+      nextRequestAt,
+      consecutive429s,
+      recentBgTimestamps,
+      updatedAt: now,
     })
   );
 }
@@ -164,6 +201,7 @@ function applyHydratedAuthorRecord(key, val, now) {
     const hotObj = { hasHot: val.hasHot, hotError: '', retryable: false };
     authorCache.set(key, {
       expiresAt: val.expiresAt,
+      retryAfterAt: 0,
       hotResult: hotObj,
       hotPromise: Promise.resolve(hotObj),
       promise: Promise.resolve(status),
@@ -178,6 +216,7 @@ function applyHydratedAuthorRecord(key, val, now) {
     if (!existing || !existing.settledStatus) {
       authorCache.set(key, {
         expiresAt: val.expiresAt,
+        retryAfterAt: 0,
         hotResult: hotObj,
         hotPromise: Promise.resolve(hotObj),
         promise: null,
@@ -220,6 +259,10 @@ function persistAuthorCacheToSession() {
     const now = Date.now();
     const serializable = {};
     for (const [key, entry] of authorCache.entries()) {
+      if (entry.expiresAt !== Infinity && entry.expiresAt <= now) {
+        authorCache.delete(key);
+        continue;
+      }
       if (
         entry.expiresAt !== Infinity &&
         entry.expiresAt > now &&
@@ -269,20 +312,65 @@ class RequestError extends Error {
 
 class CancelledCheck extends Error {}
 
+function parseHeaderNumber(raw, mode = 'min') {
+  if (raw === null || raw === undefined) return NaN;
+  const parts = String(raw)
+    .split(',')
+    .map((p) => Number(p.trim()))
+    .filter((n) => Number.isFinite(n));
+  if (!parts.length) return NaN;
+  return mode === 'max' ? Math.max(...parts) : Math.min(...parts);
+}
+
+function extractWaitMsFromBody(bodyText) {
+  if (!bodyText) return 0;
+  try {
+    const json = JSON.parse(bodyText);
+    const rateSec = Number(json?.json?.ratelimit ?? json?.ratelimit ?? json?.retry_after);
+    if (Number.isFinite(rateSec) && rateSec > 0) return Math.ceil(rateSec * 1000);
+  } catch {
+    // Response is plain text or HTML; fall through to regex parsing.
+  }
+  const secMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*seconds?/i);
+  if (secMatch) return Math.ceil(Number(secMatch[1]) * 1000);
+  const minMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*minutes?/i);
+  if (minMatch) return Math.ceil(Number(minMatch[1]) * 60 * 1000);
+  return 0;
+}
+
 function getAdaptiveIntervalMs(isPriorityOrContinuation) {
-  if (isPriorityOrContinuation) return Math.min(REQUEST_INTERVAL_MS, 400);
+  if (isPriorityOrContinuation) return PRIORITY_INTERVAL_MS;
   if (lastRateLimitRemaining !== null && Number.isFinite(lastRateLimitRemaining)) {
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 10) return 1600;
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 25) return 1200;
+    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 10) return 3600;
+    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 25) return 2800;
   }
   return REQUEST_INTERVAL_MS;
 }
 
-function getEntryBlockedUntil(entry) {
+function getBgBudgetResumeAt(now) {
+  recentBgTimestamps = pruneRecentTimestamps(recentBgTimestamps, now);
+  let resumeAt = 0;
+
+  const shortCutoff = now - BG_WINDOW_SHORT_MS;
+  const inShortWindow = recentBgTimestamps.filter((ts) => ts > shortCutoff);
+  if (inShortWindow.length >= BG_MAX_PER_MIN) {
+    const oldestShort = inShortWindow[inShortWindow.length - BG_MAX_PER_MIN];
+    resumeAt = Math.max(resumeAt, oldestShort + BG_WINDOW_SHORT_MS + 50);
+  }
+
+  if (recentBgTimestamps.length >= BG_MAX_PER_10MIN) {
+    const oldestLong = recentBgTimestamps[recentBgTimestamps.length - BG_MAX_PER_10MIN];
+    resumeAt = Math.max(resumeAt, oldestLong + BG_WINDOW_LONG_MS + 50);
+  }
+
+  return resumeAt;
+}
+
+function getEntryBlockedUntil(entry, now = Date.now()) {
   if (entry.continuation || entry.priority) {
     return Math.max(nextRequestAt, rateLimitedUntil, hoverPausedUntil);
   }
-  return Math.max(nextRequestAt, rateLimitedUntil, bgPausedUntil);
+  return Math.max(nextRequestAt, rateLimitedUntil, bgPausedUntil, getBgBudgetResumeAt(now));
 }
 
 function enqueueRequest(task, priority = false, isRelevant = () => true, meta = {}) {
@@ -335,12 +423,14 @@ function processQueue() {
   if (document.visibilityState === 'hidden' || pendingBlocks.size > 0) return;
   if (activeRequests >= MAX_CONCURRENT || fetchQueue.length === 0) return;
 
+  hydrateRateLimitFromStorage();
+
   const now = Date.now();
   let runnableIndex = -1;
   let minDelay = Infinity;
 
   for (let i = 0; i < fetchQueue.length; i++) {
-    const delay = getEntryBlockedUntil(fetchQueue[i]) - now;
+    const delay = getEntryBlockedUntil(fetchQueue[i], now) - now;
     if (delay <= 0) {
       runnableIndex = i;
       break;
@@ -357,7 +447,11 @@ function processQueue() {
 
   const [entry] = fetchQueue.splice(runnableIndex, 1);
   activeRequests++;
-  nextRequestAt = Date.now() + getAdaptiveIntervalMs(entry.priority || entry.continuation);
+  const startedAt = Date.now();
+  recentBgTimestamps.push(startedAt);
+  nextRequestAt = startedAt + getAdaptiveIntervalMs(entry.priority || entry.continuation);
+  persistRateLimitToStorage();
+
   Promise.resolve()
     .then(entry.task)
     .then(entry.resolve, entry.reject)
@@ -368,44 +462,70 @@ function processQueue() {
   processQueue();
 }
 
-function respectRateLimit(res) {
+function respectRateLimit(res, extraWaitMs = 0) {
   const now = Date.now();
   let changed = false;
+
   if (res.status === 429) {
+    consecutive429s++;
     const value = res.headers.get('Retry-After');
     const seconds = value === null ? NaN : Number(value);
-    const retryAt = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(value);
-    rateLimitedUntil = Math.max(
-      rateLimitedUntil,
-      Number.isFinite(retryAt) ? retryAt : now + FAILURE_TTL_MS
+    const headerRetryAt = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(value);
+    const expBackoff = Math.min(
+      RATE_LIMIT_BASE_BACKOFF_MS * Math.pow(2, Math.min(consecutive429s - 1, 2)),
+      RATE_LIMIT_MAX_BACKOFF_MS
     );
+    const bodyRetryAt = extraWaitMs > 0 ? now + extraWaitMs + 1000 : 0;
+    const targetUntil = Math.max(
+      Number.isFinite(headerRetryAt) ? headerRetryAt : 0,
+      bodyRetryAt,
+      now + expBackoff
+    );
+    rateLimitedUntil = Math.max(rateLimitedUntil, targetUntil);
+    changed = true;
+  } else if (res.ok && consecutive429s > 0) {
+    consecutive429s = 0;
     changed = true;
   }
-  const remainingRaw = res.headers.get('X-Ratelimit-Remaining');
-  const reset = Number(res.headers.get('X-Ratelimit-Reset'));
-  if (remainingRaw !== null) {
-    const remaining = Number(remainingRaw);
-    if (Number.isFinite(remaining)) {
-      lastRateLimitRemaining = remaining;
-      if (Number.isFinite(reset) && reset > 0) {
-        const resetAt = now + reset * 1000;
-        if (remaining <= BG_RATELIMIT_RESERVE) {
-          bgPausedUntil = Math.max(bgPausedUntil, resetAt);
-          changed = true;
-        }
-        if (remaining <= MIN_RATELIMIT_RESERVE) {
-          hoverPausedUntil = Math.max(hoverPausedUntil, resetAt);
-          changed = true;
-        }
+
+  const remaining = parseHeaderNumber(res.headers.get('X-Ratelimit-Remaining'), 'min');
+  const reset = parseHeaderNumber(res.headers.get('X-Ratelimit-Reset'), 'max');
+  if (Number.isFinite(remaining)) {
+    lastRateLimitRemaining = remaining;
+    if (Number.isFinite(reset) && reset > 0) {
+      const resetAt = now + reset * 1000;
+      if (remaining <= BG_RATELIMIT_RESERVE) {
+        bgPausedUntil = Math.max(bgPausedUntil, resetAt);
+        changed = true;
+      }
+      if (remaining <= MIN_RATELIMIT_RESERVE) {
+        hoverPausedUntil = Math.max(hoverPausedUntil, resetAt);
+        changed = true;
       }
     }
   }
+
   if (changed) persistRateLimitToStorage();
+}
+
+function isAllowedListingRedirect(originalUrl, finalUrlStr) {
+  try {
+    const orig = new URL(originalUrl, location.origin);
+    const dest = new URL(finalUrlStr, location.origin);
+    return (
+      orig.origin === dest.origin &&
+      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(orig.pathname) &&
+      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(dest.pathname)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function requestJson(url, options = {}, priority = false, isRelevant = () => true, queueMeta = {}) {
   const task = async () => {
-    if (priority && rateLimitedUntil > Date.now()) {
+    hydrateRateLimitFromStorage();
+    if (rateLimitedUntil > Date.now()) {
       const waitSec = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
       throw new RequestError(`Reddit rate limit active. Please wait ${waitSec}s.`, {
         status: 429,
@@ -421,7 +541,14 @@ function requestJson(url, options = {}, priority = false, isRelevant = () => tru
         headers: { Accept: 'application/json', ...options.headers },
         signal: controller.signal,
       });
-      respectRateLimit(res);
+
+      let bodyWaitMs = 0;
+      if (res.status === 429) {
+        const bodyText = await res.text().catch(() => '');
+        bodyWaitMs = extractWaitMsFromBody(bodyText);
+      }
+      respectRateLimit(res, bodyWaitMs);
+
       if (!res.ok) {
         const message =
           res.status === 429
@@ -435,8 +562,9 @@ function requestJson(url, options = {}, priority = false, isRelevant = () => tru
           uncertain: res.status >= 500,
         });
       }
-      if (res.redirected) {
+      if (res.redirected && !isAllowedListingRedirect(url, res.url)) {
         throw new RequestError('Reddit redirected the request. Check your session.', {
+          retryable: true,
           uncertain: true,
         });
       }
@@ -446,10 +574,16 @@ function requestJson(url, options = {}, priority = false, isRelevant = () => tru
         data = await res.json();
       } catch (error) {
         if (controller.signal.aborted) throw error;
-        throw new RequestError('Reddit returned an unreadable response.', { uncertain: true });
+        throw new RequestError('Reddit returned an unreadable response.', {
+          retryable: true,
+          uncertain: true,
+        });
       }
       if (!data || typeof data !== 'object' || Array.isArray(data)) {
-        throw new RequestError('Reddit returned an unexpected response.', { uncertain: true });
+        throw new RequestError('Reddit returned an unexpected response.', {
+          retryable: true,
+          uncertain: true,
+        });
       }
       const errors = data.json?.errors ?? data.errors;
       if (Array.isArray(errors) && errors.length) {
@@ -461,7 +595,7 @@ function requestJson(url, options = {}, priority = false, isRelevant = () => tru
           const seconds = Number(data.json?.ratelimit);
           rateLimitedUntil = Math.max(
             rateLimitedUntil,
-            Date.now() + (seconds > 0 ? seconds * 1000 : FAILURE_TTL_MS)
+            Date.now() + (seconds > 0 ? seconds * 1000 : RATE_LIMIT_BASE_BACKOFF_MS)
           );
           persistRateLimitToStorage();
         }
@@ -768,7 +902,7 @@ function lockAuthorButtonsTemporarily(author, ms) {
   }, ms);
 }
 
-function createBlockBtn(author, authorId) {
+function createBlockBtn(author, initialAuthorId) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.dataset.role = 'block';
@@ -785,6 +919,8 @@ function createBlockBtn(author, authorId) {
     const key = author.toLowerCase();
     if (btn.disabled || pendingBlocks.has(key) || blockedAuthors.has(key)) return;
 
+    const currentAuthorId = btn.closest(`.${WRAP_CLASS}`)?.dataset.authorId || initialAuthorId;
+
     authorErrors.delete(key);
     pendingBlocks.add(key);
     updateBlockButtons(author);
@@ -792,7 +928,7 @@ function createBlockBtn(author, authorId) {
 
     let failure = null;
     try {
-      await enqueueBlockTask(() => blockAccountRequest(author, authorId));
+      await enqueueBlockTask(() => blockAccountRequest(author, currentAuthorId));
       markAuthorBlockedInDom(author);
     } catch (error) {
       failure = error;
@@ -825,7 +961,7 @@ async function checkListingHasPosts(url, priority = false, isRelevant = () => tr
   });
   const children = data?.data?.children;
   if (data?.kind !== 'Listing' || !Array.isArray(children)) {
-    throw new RequestError('Reddit returned an invalid post listing.');
+    throw new RequestError('Reddit returned an invalid post listing.', { retryable: true });
   }
 
   return children.length > 0;
@@ -843,9 +979,6 @@ function syncAuthorListingButtonsInDom(author, status) {
     }
     if ('hasTop' in status && status.hasTop !== undefined) {
       renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.topError || '');
-    }
-    if (typeof status.hasHot === 'boolean' && typeof status.hasTop === 'boolean') {
-      wrap.dataset.statusRequested = 'true';
     }
   });
 }
@@ -879,23 +1012,15 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
     return cached.promise;
   }
 
-  if (cached && !cached.settledStatus && !cached.hotResult && cached.expiresAt > now && !priority) {
-    if (onHot && cached.hotPromise) {
-      cached.hotPromise.then((hot) => {
-        if (!hot.cancelled) onHot(hot);
-      });
-    }
-    if (cached.promise) return cached.promise;
-  }
-
   const encoded = encodeURIComponent(author);
   const preservedHot =
-    cached && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean'
+    cached && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean' && cached.expiresAt > now
       ? cached.hotResult
       : null;
 
   const entry = {
     expiresAt: Infinity,
+    retryAfterAt: 0,
     hotResult: preservedHot,
     hotPromise: null,
     promise: null,
@@ -933,6 +1058,7 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
         return {
           hasHot: null,
           hotError: error.message,
+          status: error.status || 0,
           retryable: error.retryable,
         };
       }
@@ -955,7 +1081,12 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
       } else if (hot.emptyProfile) {
         top = { hasTop: false, topError: '', retryable: false };
       } else if (hot.hasHot === null) {
-        top = { hasTop: null, topError: hot.hotError, retryable: hot.retryable };
+        top = {
+          hasTop: null,
+          topError: hot.hotError,
+          status: hot.status || 0,
+          retryable: hot.retryable,
+        };
       } else {
         try {
           top = {
@@ -975,15 +1106,23 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
           if (error instanceof RequestError && error.status === 404) {
             top = { hasTop: false, topError: '', retryable: false };
           } else {
-            top = { hasTop: null, topError: error.message, retryable: error.retryable };
+            top = {
+              hasTop: null,
+              topError: error.message,
+              status: error.status || 0,
+              retryable: error.retryable,
+            };
           }
         }
       }
       const failed = hot.hasHot === null || top.hasTop === null;
-      entry.expiresAt = Math.max(
-        Date.now() + (failed ? FAILURE_TTL_MS : STATUS_TTL_MS),
-        failed ? rateLimitedUntil : 0
-      );
+      const is429 = hot.status === 429 || top.status === 429;
+      const nowEnd = Date.now();
+      entry.expiresAt = failed
+        ? Math.max(nowEnd + FAILURE_TTL_MS, rateLimitedUntil)
+        : nowEnd + STATUS_TTL_MS;
+      entry.retryAfterAt = failed ? entry.expiresAt : 0;
+
       for (const [oldKey, oldEntry] of authorCache) {
         if (authorCache.size <= MAX_CACHE_SIZE) break;
         if (oldEntry.expiresAt !== Infinity) authorCache.delete(oldKey);
@@ -993,6 +1132,7 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
         hotError: hot.hotError || '',
         hasTop: top.hasTop,
         topError: top.topError || '',
+        rateLimited: is429,
         retryable: Boolean(hot.retryable || top.retryable),
         retryAt: entry.expiresAt,
       };
@@ -1001,6 +1141,7 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
         syncAuthorListingButtonsInDom(author, result);
         schedulePersistAuthorCache();
       } else if (typeof hot.hasHot === 'boolean') {
+        entry.expiresAt = nowEnd + STATUS_TTL_MS;
         syncAuthorListingButtonsInDom(author, { hasHot: hot.hasHot, hotError: '' });
         schedulePersistAuthorCache();
       }
@@ -1011,6 +1152,7 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
       if (status.cancelled) {
         if (entry.hotResult && typeof entry.hotResult.hasHot === 'boolean') {
           entry.expiresAt = Date.now() + STATUS_TTL_MS;
+          entry.retryAfterAt = 0;
           entry.promise = null;
           schedulePersistAuthorCache();
         } else if (authorCache.get(key) === entry) {
@@ -1027,7 +1169,7 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
 function renderListingState(btn, hasPosts, label, emptyLabel, error) {
   if (!btn) return;
   btn.dataset.postsState = hasPosts === null ? 'unknown' : hasPosts ? 'present' : 'empty';
-  btn.title = hasPosts === null ? `Could not check posts: ${error}` : '';
+  btn.title = hasPosts === null && error ? `Could not check posts: ${error}` : '';
   if (hasPosts === false) setEmptyState(btn, emptyLabel);
   else {
     applyTheme(btn, NORMAL_THEME);
@@ -1067,50 +1209,50 @@ async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
     if (!wrap.isConnected || wrap.dataset.author !== author) return;
     renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError);
     renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.topError);
-    if (canRetry && status.retryable && wrap.dataset.statusRetry !== 'true') {
+
+    // Do NOT schedule per-card retry timers on HTTP 429 (queue/dwell handles recovery cleanly).
+    if (canRetry && status.retryable && !status.rateLimited && wrap.dataset.statusRetry !== 'true') {
       wrap.dataset.statusRetry = 'true';
       setTimeout(() => {
         if (wrap.isConnected && wrap.dataset.author === author) {
-          wrap.dataset.retryReady = 'true';
           requestVisibleStatus(wrap);
         }
-      }, Math.min(Math.max(status.retryAt - Date.now(), 0) + 1, 2147483647));
+      }, Math.min(Math.max(status.retryAt - Date.now(), 0) + 50, 2147483647));
     }
   } finally {
     wrap.dataset.statusChecking = 'false';
-    if (cancelled) {
-      wrap.dataset.statusRequested = 'false';
+    if (cancelled && wrap.isConnected && wrap.dataset.nearby === 'true') {
       requestVisibleStatus(wrap);
     }
   }
 }
 
 function requestVisibleStatus(wrap) {
-  if (!wrap.isConnected || document.visibilityState === 'hidden' || wrap.dataset.nearby !== 'true')
+  if (!wrap.isConnected || document.visibilityState === 'hidden' || wrap.dataset.nearby !== 'true') {
     return;
+  }
   const key = (wrap.dataset.author || '').toLowerCase();
   if (!key || blockedAuthors.has(key)) return;
   if (wrap.dataset.statusChecking === 'true') return;
+
+  const now = Date.now();
   const cached = authorCache.get(key);
-  if (cached && cached.settledStatus && cached.expiresAt > Date.now()) {
+  if (cached && cached.settledStatus && cached.expiresAt > now) {
     const postsBtn = wrap.querySelector('[data-role="posts"]');
     const topBtn = wrap.querySelector('[data-role="top"]');
     renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
     renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
-    wrap.dataset.statusRequested = 'true';
     return;
   }
-  const hasIncompleteHot =
-    cached && !cached.settledStatus && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean';
-  if (
-    wrap.dataset.statusRequested === 'true' &&
-    wrap.dataset.retryReady !== 'true' &&
-    !hasIncompleteHot
-  ) {
+
+  if (cached && cached.expiresAt !== Infinity && cached.retryAfterAt > now) {
     return;
   }
-  wrap.dataset.statusRequested = 'true';
-  wrap.dataset.retryReady = 'false';
+
+  if (rateLimitedUntil > now || bgPausedUntil > now) {
+    return;
+  }
+
   updateAuthorStatus(wrap, wrap.dataset.statusRetry !== 'true', false);
 }
 
@@ -1132,12 +1274,8 @@ const visibilityObserver = new IntersectionObserver(
       if (entry.isIntersecting) {
         const key = (wrap.dataset.author || '').toLowerCase();
         const cached = authorCache.get(key);
-        if (
-          cached &&
-          cached.expiresAt > Date.now() &&
-          cached.expiresAt !== Infinity &&
-          (cached.settledStatus || cached.hotResult)
-        ) {
+        const now = Date.now();
+        if (cached && cached.settledStatus && cached.expiresAt > now) {
           requestVisibleStatus(wrap);
         } else {
           const timer = setTimeout(() => {
@@ -1207,7 +1345,6 @@ function applyCachedAuthorStatusToWrap(wrap, author) {
   if (cached.settledStatus) {
     renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
     renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
-    wrap.dataset.statusRequested = 'true';
   } else if (cached.hotResult && typeof cached.hotResult.hasHot === 'boolean') {
     renderListingState(postsBtn, cached.hotResult.hasHot, 'Posts', 'No posts', '');
   }
@@ -1234,9 +1371,7 @@ function createBtnGroup(author, authorId) {
   wrap.appendChild(topBtn);
   wrap.appendChild(blockBtn);
 
-  // Immediately apply cached state if already known from storage or memory.
   applyCachedAuthorStatusToWrap(wrap, author);
-
   visibilityObserver.observe(wrap);
 
   const checkOnIntent = () => {
@@ -1246,18 +1381,16 @@ function createBtnGroup(author, authorId) {
       promoteAuthorInQueue(key);
       return;
     }
+    const now = Date.now();
     const entry = authorCache.get(key);
-    if (
-      wrap.dataset.statusRequested === 'true' &&
-      entry &&
-      entry.settledStatus &&
-      entry.expiresAt > Date.now()
-    ) {
+    if (entry && entry.settledStatus && entry.expiresAt > now) {
       renderListingState(postsBtn, entry.settledStatus.hasHot, 'Posts', 'No posts', '');
       renderListingState(topBtn, entry.settledStatus.hasTop, 'Top posts', 'No top', '');
       return;
     }
-    wrap.dataset.statusRequested = 'true';
+    if (rateLimitedUntil > now || hoverPausedUntil > now) {
+      return;
+    }
     wrap.dataset.nearby = 'true';
     updateAuthorStatus(wrap, false, true);
   };
@@ -1270,10 +1403,12 @@ function createBtnGroup(author, authorId) {
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
+    hydrateRateLimitFromStorage();
     document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
       visibilityObserver.unobserve(wrap);
       visibilityObserver.observe(wrap);
     });
+    processQueue();
   } else {
     persistAuthorCacheToSession();
     document.querySelectorAll(`.${WRAP_CLASS}`).forEach(clearDwellTimer);
@@ -1357,7 +1492,10 @@ function processPost(post) {
 
   const existing = findOwnWrap(post);
   if (existing) {
-    if (existing.dataset.author === author && existing.dataset.authorId === authorId) {
+    if (existing.dataset.author === author) {
+      if (existing.dataset.authorId !== authorId) {
+        existing.dataset.authorId = authorId;
+      }
       applyCachedAuthorStatusToWrap(existing, author);
       if (detachedWraps.has(existing)) {
         detachedWraps.delete(existing);
