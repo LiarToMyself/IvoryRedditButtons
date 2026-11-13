@@ -1418,7 +1418,8 @@ function scheduleProcessPosts(mutations) {
       mutation.target.nodeType === 1 ? mutation.target.closest(POST_SELECTOR) : null;
     if (parentPost) pendingPosts.add(parentPost);
     mutation.addedNodes.forEach(collectPosts);
-    mutation.removedNodes.forEach((node) => {\n      if (node.nodeType !== 1 || node.isConnected) return;
+    mutation.removedNodes.forEach((node) => {
+      if (node.nodeType !== 1 || node.isConnected) return;
       const detach = (wrap) => {
         clearDwellTimer(wrap);
         wrap.dataset.nearby = 'false';
