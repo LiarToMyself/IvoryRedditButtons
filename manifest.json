@@ -1,8 +1,11 @@
 {
   "manifest_version": 3,
   "name": "IvoryRedditButtons",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Direct Posts, Top posts (with red empty-listing indicators), and 1-click Block buttons on Reddit without rate-limit flooding.",
+  "icons": {
+    "128": "icon.png"
+  },
   "content_scripts": [
     {
       "matches": ["*://*.reddit.com/*"],

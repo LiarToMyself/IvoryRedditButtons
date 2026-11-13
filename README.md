@@ -2,16 +2,15 @@
 
 Lightweight Manifest V3 Chrome extension for Reddit (Shreddit and Old Reddit). Adds three direct action buttons to every post header in feeds, post pages, and user profiles:
 
-- **Posts** - opens `/user/<author>/submitted/?sort=hot` directly, bypassing the mixed Overview tab. Highlights in red (`✕ No posts`) and prevents navigation if the author has no visible hot posts.
+- **Posts** - opens `/user/<author>/submitted/?sort=hot` directly, bypassing the mixed Overview tab. Highlights in red (`✕ No posts`) and prevents navigation if the author has no visible posts.
 - **Top posts** - opens `/user/<author>/submitted/?sort=top&t=all`. Highlights in red (`✕ No top`) and prevents navigation if the author has no visible top posts.
 - **Block** - blocks the post author in one click directly from the feed without opening their profile.
 
-## Key Features in v1.4.2
+## Key Features in v1.4.3
 
-- **Red Empty-State Indicators (`✕ No posts` / `✕ No top`)**: Checks author post listings near the viewport and on hover, highlighting empty or unavailable (`HTTP 404`) listings in red, prioritizing the `sort=top&t=all` continuation check (`unshift`), preserving partial `hasHot: false` state across scroll cancellations, and syncing all cards of the same author in the DOM.
-- **Three-Tier Rate-Limit Protection (`HTTP 429` Prevention)**: Uses a `350ms` viewport dwell filter, `800ms` adaptive request pacing (`MAX_CONCURRENT = 1`), `X-Ratelimit-Remaining <= 25` background prefetch pause (`bgPausedUntil`), `X-Ratelimit-Remaining <= 5` hover reserve (`hoverPausedUntil`), and unblocked `Block` execution unless a hard `HTTP 429` (`rateLimitedUntil`) is active.
-- **Cross-Tab Cache & Rate-Limit Sync**: Shares checked author statuses (`30 min` TTL), blocked authors, and rate-limit pause timers across all Reddit tabs via `localStorage` (`storage` event) with `sessionStorage` fallback and `500ms` debounced writes.
-- **Crosspost-Safe DOM Injection & Reliable 1-Click Block**: Scopes header and button lookups to each post's own container so nested crossposts never collide, and uses DOM/cookie CSRF and cached modhash tokens with sequential `Block` queuing.
+- **Accurate Single-Query Empty-State Detection (`✕ No posts` / `✕ No top`)**: Queries `/user/<author>/submitted.json?limit=5&sort=hot&raw_json=1` (1 request per author instead of 2), filters out removed/spam/hidden/deleted placeholder items (`isVisibleSubmissionItem`), treats `HTTP 403` / `HTTP 404` as empty, and updates both buttons atomically across all cards of the author.
+- **Zero Rate-Limit Lockouts (`HTTP 429` Prevention)**: Halves background request volume, uses LIFO viewport prioritization (`VIEWPORT_DWELL_MS = 120ms`, `PREFETCH_MARGIN_PX = 350px`), preserves button wrappers across Shreddit `author-id` hydration, caps transient quota pauses in memory without freezing future sessions in `localStorage`, and keeps a 1-hour cross-tab `localStorage` status cache (`ivory_reddit_author_status_v2`).
+- **Crosspost-Safe DOM Injection & Reliable 1-Click Block**: Scopes header and button lookups to each post's own container so nested crossposts never collide, dynamically reads hydrated `author-id` on click, and uses DOM/cookie CSRF and cached modhash tokens with sequential `Block` queuing.
 
 ## Installation
 
@@ -25,6 +24,6 @@ Lightweight Manifest V3 Chrome extension for Reddit (Shreddit and Old Reddit). A
 
 - `manifest.json` - Chrome Extension Manifest V3 configuration.
 - `content.js` - Content script for DOM button injection, empty-listing detection, and block API handling.
-- `plans/CHANGES-1.4.2-argon.md` - Root-cause analysis and v1.4.2 changelog (Issues #2, #3, #5, #6, #7, #8).
-- `plans/CHANGES-1.4-argon.md` - Historical analysis of v1.3.8 rate-limit bugs and v1.4.0 / v1.4.1 changes.
-- `CHANGES-1.3.md`, `CHANGES-1.2.md`, `REVIEW-2026-10-22.md` - Historical changelogs and audits from prior versions.
+- `icon.png` - Extension icon (128x128).
+- `plans/CHANGES-1.4.3.md` - Root-cause analysis of v1.4.2 bugs and v1.4.3 changelog (Issue #10).
+- `plans/CHANGES-1.4.2-argon.md`, `plans/CHANGES-1.4-argon.md`, `plans/CHANGES-1.3.md`, `plans/CHANGES-1.2.md`, `plans/REVIEW-2026-10-22.md` - Historical changelogs and audits from prior versions.

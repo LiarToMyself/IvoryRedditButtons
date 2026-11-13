@@ -1,8 +1,9 @@
 const WRAP_CLASS = 'author-btns-wrap';
 const POST_SELECTOR = 'shreddit-post, .thing.link';
 const BLOCKED_STORAGE_KEY = 'ivory_reddit_blocked_v1';
-const STATUS_STORAGE_KEY = 'ivory_reddit_author_status_v1';
-const RATELIMIT_STORAGE_KEY = 'ivory_reddit_ratelimit_v1';
+const STATUS_STORAGE_KEY = 'ivory_reddit_author_status_v2';
+const RATELIMIT_STORAGE_KEY = 'ivory_reddit_ratelimit_v2';
+const LEGACY_STORAGE_KEYS = ['ivory_reddit_author_status_v1', 'ivory_reddit_ratelimit_v1'];
 
 const BASE_BTN_STYLE =
   'position:relative;z-index:10;pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;height:26px;min-height:26px;max-height:26px;min-width:0;appearance:none;vertical-align:middle;gap:5px;margin:0;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:16px;text-decoration:none;white-space:nowrap;cursor:pointer;user-select:none;font-family:inherit;flex-shrink:0;transition:background 0.15s,border-color 0.15s,color 0.15s,opacity 0.15s;';
@@ -39,18 +40,18 @@ const BADGE_STYLE =
   'display:inline-block;padding:1px 5px;background:#6e2c33;color:#ffd7d5;border-radius:999px;font-size:10px;font-weight:700;line-height:13px;';
 
 const MAX_CONCURRENT = 1;
-const REQUEST_TIMEOUT_MS = 15000;
-const REQUEST_INTERVAL_MS = 800;
-const VIEWPORT_DWELL_MS = 350;
-const STATUS_TTL_MS = 30 * 60 * 1000;
-const FAILURE_TTL_MS = 60 * 1000;
-const MAX_CACHE_SIZE = 500;
-const PREFETCH_MARGIN_PX = 120;
+const REQUEST_TIMEOUT_MS = 12000;
+const REQUEST_INTERVAL_MS = 750;
+const VIEWPORT_DWELL_MS = 120;
+const STATUS_TTL_MS = 60 * 60 * 1000;
+const FAILURE_TTL_MS = 30 * 1000;
+const MAX_CACHE_SIZE = 1000;
+const PREFETCH_MARGIN_PX = 350;
 const BLOCK_COOLDOWN_MS = 1500;
 const ERROR_LOCK_MS = 2000;
-const BG_RATELIMIT_RESERVE = 25;
-const MIN_RATELIMIT_RESERVE = 5;
-const PERSIST_DEBOUNCE_MS = 500;
+const BG_RATELIMIT_RESERVE = 8;
+const MIN_RATELIMIT_RESERVE = 3;
+const PERSIST_DEBOUNCE_MS = 400;
 
 const authorCache = new Map();
 const blockedAuthors = loadBlockedAuthors();
@@ -58,6 +59,7 @@ const pendingBlocks = new Set();
 const authorErrors = new Map();
 const detachedWraps = new WeakSet();
 const dwellTimers = new WeakMap();
+const postToWrapMap = new WeakMap();
 const fetchQueue = [];
 
 let activeRequests = 0;
@@ -72,9 +74,26 @@ let persistTimer = null;
 let cachedModhash = '';
 let modhashPromise = null;
 let blockChain = Promise.resolve();
+let checkSequence = 0;
 
+cleanupLegacyStorage();
 hydrateRateLimitFromStorage();
 hydrateAuthorCacheFromSession();
+
+function cleanupLegacyStorage() {
+  for (const key of LEGACY_STORAGE_KEYS) {
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(key);
+    } catch {
+      // Ignore storage access errors.
+    }
+    try {
+      if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(key);
+    } catch {
+      // Ignore storage access errors.
+    }
+  }
+}
 
 function readStorageItem(key) {
   try {
@@ -128,12 +147,6 @@ function hydrateRateLimitFromStorage() {
     if (typeof parsed.rateLimitedUntil === 'number' && parsed.rateLimitedUntil > now) {
       rateLimitedUntil = Math.max(rateLimitedUntil, parsed.rateLimitedUntil);
     }
-    if (typeof parsed.bgPausedUntil === 'number' && parsed.bgPausedUntil > now) {
-      bgPausedUntil = Math.max(bgPausedUntil, parsed.bgPausedUntil);
-    }
-    if (typeof parsed.hoverPausedUntil === 'number' && parsed.hoverPausedUntil > now) {
-      hoverPausedUntil = Math.max(hoverPausedUntil, parsed.hoverPausedUntil);
-    }
   } catch {
     // Ignore malformed rate-limit state.
   }
@@ -144,8 +157,6 @@ function persistRateLimitToStorage() {
     RATELIMIT_STORAGE_KEY,
     JSON.stringify({
       rateLimitedUntil,
-      bgPausedUntil,
-      hoverPausedUntil,
     })
   );
 }
@@ -173,20 +184,25 @@ function applyHydratedAuthorRecord(key, val, now) {
       settledStatus: status,
     });
   } else if (typeof val.hasHot === 'boolean') {
+    const status = {
+      hasHot: val.hasHot,
+      hotError: '',
+      hasTop: val.hasHot,
+      topError: '',
+      retryable: false,
+      retryAt: val.expiresAt,
+    };
     const hotObj = { hasHot: val.hasHot, hotError: '', retryable: false };
-    const existing = authorCache.get(key);
-    if (!existing || !existing.settledStatus) {
-      authorCache.set(key, {
-        expiresAt: val.expiresAt,
-        hotResult: hotObj,
-        hotPromise: Promise.resolve(hotObj),
-        promise: null,
-        consumers: new Set(),
-        unscoped: false,
-        priority: false,
-        settledStatus: null,
-      });
-    }
+    authorCache.set(key, {
+      expiresAt: val.expiresAt,
+      hotResult: hotObj,
+      hotPromise: Promise.resolve(hotObj),
+      promise: Promise.resolve(status),
+      consumers: new Set(),
+      unscoped: false,
+      priority: false,
+      settledStatus: status,
+    });
   }
 }
 
@@ -232,16 +248,6 @@ function persistAuthorCacheToSession() {
           hasTop: entry.settledStatus.hasTop,
           expiresAt: entry.expiresAt,
         };
-      } else if (
-        entry.expiresAt !== Infinity &&
-        entry.expiresAt > now &&
-        entry.hotResult &&
-        typeof entry.hotResult.hasHot === 'boolean'
-      ) {
-        serializable[key] = {
-          hasHot: entry.hotResult.hasHot,
-          expiresAt: entry.expiresAt,
-        };
       }
     }
     writeStorageItem(STATUS_STORAGE_KEY, JSON.stringify(serializable));
@@ -269,17 +275,17 @@ class RequestError extends Error {
 
 class CancelledCheck extends Error {}
 
-function getAdaptiveIntervalMs(isPriorityOrContinuation) {
-  if (isPriorityOrContinuation) return Math.min(REQUEST_INTERVAL_MS, 400);
+function getAdaptiveIntervalMs(isPriority) {
+  if (isPriority) return 350;
   if (lastRateLimitRemaining !== null && Number.isFinite(lastRateLimitRemaining)) {
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 10) return 1600;
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 25) return 1200;
+    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 8) return 1400;
+    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 20) return 1000;
   }
   return REQUEST_INTERVAL_MS;
 }
 
 function getEntryBlockedUntil(entry) {
-  if (entry.continuation || entry.priority) {
+  if (entry.priority) {
     return Math.max(nextRequestAt, rateLimitedUntil, hoverPausedUntil);
   }
   return Math.max(nextRequestAt, rateLimitedUntil, bgPausedUntil);
@@ -293,10 +299,10 @@ function enqueueRequest(task, priority = false, isRelevant = () => true, meta = 
       reject,
       isRelevant,
       priority: Boolean(priority),
-      continuation: Boolean(meta.continuation),
       authorKey: meta.authorKey ? String(meta.authorKey).toLowerCase() : '',
+      seq: ++checkSequence,
     };
-    if (entry.continuation || entry.priority) {
+    if (entry.priority) {
       fetchQueue.unshift(entry);
     } else {
       fetchQueue.push(entry);
@@ -313,6 +319,7 @@ function promoteAuthorInQueue(authorKey) {
     if (fetchQueue[i].authorKey === key) {
       const [entry] = fetchQueue.splice(i, 1);
       entry.priority = true;
+      entry.seq = ++checkSequence;
       fetchQueue.unshift(entry);
       promoted = true;
     }
@@ -337,15 +344,22 @@ function processQueue() {
 
   const now = Date.now();
   let runnableIndex = -1;
+  let bestScore = -Infinity;
   let minDelay = Infinity;
 
   for (let i = 0; i < fetchQueue.length; i++) {
-    const delay = getEntryBlockedUntil(fetchQueue[i]) - now;
+    const item = fetchQueue[i];
+    const delay = getEntryBlockedUntil(item) - now;
     if (delay <= 0) {
-      runnableIndex = i;
-      break;
+      // Prioritize user-hovered items first, then most recently viewed cards (LIFO).
+      const score = (item.priority ? 1e12 : 0) + item.seq;
+      if (score > bestScore) {
+        bestScore = score;
+        runnableIndex = i;
+      }
+    } else if (delay < minDelay) {
+      minDelay = delay;
     }
-    if (delay < minDelay) minDelay = delay;
   }
 
   if (runnableIndex === -1) {
@@ -357,7 +371,7 @@ function processQueue() {
 
   const [entry] = fetchQueue.splice(runnableIndex, 1);
   activeRequests++;
-  nextRequestAt = Date.now() + getAdaptiveIntervalMs(entry.priority || entry.continuation);
+  nextRequestAt = Date.now() + getAdaptiveIntervalMs(entry.priority);
   Promise.resolve()
     .then(entry.task)
     .then(entry.resolve, entry.reject)
@@ -370,7 +384,7 @@ function processQueue() {
 
 function respectRateLimit(res) {
   const now = Date.now();
-  let changed = false;
+  let hardLimitChanged = false;
   if (res.status === 429) {
     const value = res.headers.get('Retry-After');
     const seconds = value === null ? NaN : Number(value);
@@ -379,7 +393,7 @@ function respectRateLimit(res) {
       rateLimitedUntil,
       Number.isFinite(retryAt) ? retryAt : now + FAILURE_TTL_MS
     );
-    changed = true;
+    hardLimitChanged = true;
   }
   const remainingRaw = res.headers.get('X-Ratelimit-Remaining');
   const reset = Number(res.headers.get('X-Ratelimit-Reset'));
@@ -388,19 +402,17 @@ function respectRateLimit(res) {
     if (Number.isFinite(remaining)) {
       lastRateLimitRemaining = remaining;
       if (Number.isFinite(reset) && reset > 0) {
-        const resetAt = now + reset * 1000;
+        const resetAt = now + Math.min(reset, 120) * 1000;
         if (remaining <= BG_RATELIMIT_RESERVE) {
           bgPausedUntil = Math.max(bgPausedUntil, resetAt);
-          changed = true;
         }
         if (remaining <= MIN_RATELIMIT_RESERVE) {
           hoverPausedUntil = Math.max(hoverPausedUntil, resetAt);
-          changed = true;
         }
       }
     }
   }
-  if (changed) persistRateLimitToStorage();
+  if (hardLimitChanged) persistRateLimitToStorage();
 }
 
 function requestJson(url, options = {}, priority = false, isRelevant = () => true, queueMeta = {}) {
@@ -782,18 +794,21 @@ function createBlockBtn(author, authorId) {
     e.preventDefault();
     e.stopPropagation();
     e.stopImmediatePropagation();
-    const key = author.toLowerCase();
+    const wrap = btn.closest(`.${WRAP_CLASS}`);
+    const currentAuthor = wrap?.dataset?.author || author;
+    const currentAuthorId = wrap?.dataset?.authorId || authorId;
+    const key = currentAuthor.toLowerCase();
     if (btn.disabled || pendingBlocks.has(key) || blockedAuthors.has(key)) return;
 
     authorErrors.delete(key);
     pendingBlocks.add(key);
-    updateBlockButtons(author);
+    updateBlockButtons(currentAuthor);
     processQueue();
 
     let failure = null;
     try {
-      await enqueueBlockTask(() => blockAccountRequest(author, authorId));
-      markAuthorBlockedInDom(author);
+      await enqueueBlockTask(() => blockAccountRequest(currentAuthor, currentAuthorId));
+      markAuthorBlockedInDom(currentAuthor);
     } catch (error) {
       failure = error;
       authorErrors.set(key, error);
@@ -807,15 +822,26 @@ function createBlockBtn(author, authorId) {
           failure.status === 429
             ? Math.min(Math.max(rateLimitedUntil - Date.now(), ERROR_LOCK_MS), 15000)
             : ERROR_LOCK_MS;
-        lockAuthorButtonsTemporarily(author, lockMs);
+        lockAuthorButtonsTemporarily(currentAuthor, lockMs);
       } else {
-        updateBlockButtons(author, null);
+        updateBlockButtons(currentAuthor, null);
       }
       processQueue();
     }
   });
 
   return btn;
+}
+
+function isVisibleSubmissionItem(child) {
+  if (!child || typeof child !== 'object') return false;
+  const d = child.data;
+  if (!d || typeof d !== 'object') return false;
+  if (child.kind && child.kind !== 't3') return false;
+  if (d.removed_by_category) return false;
+  if (d.removed === true || d.spam === true || d.hidden === true) return false;
+  if (typeof d.author === 'string' && d.author === '[deleted]') return false;
+  return true;
 }
 
 async function checkListingHasPosts(url, priority = false, isRelevant = () => true, queueMeta = {}) {
@@ -828,7 +854,7 @@ async function checkListingHasPosts(url, priority = false, isRelevant = () => tr
     throw new RequestError('Reddit returned an invalid post listing.');
   }
 
-  return children.length > 0;
+  return children.some(isVisibleSubmissionItem);
 }
 
 function syncAuthorListingButtonsInDom(author, status) {
@@ -879,7 +905,7 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
     return cached.promise;
   }
 
-  if (cached && !cached.settledStatus && !cached.hotResult && cached.expiresAt > now && !priority) {
+  if (cached && !cached.settledStatus && cached.expiresAt > now && !priority) {
     if (onHot && cached.hotPromise) {
       cached.hotPromise.then((hot) => {
         if (!hot.cancelled) onHot(hot);
@@ -889,14 +915,9 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
   }
 
   const encoded = encodeURIComponent(author);
-  const preservedHot =
-    cached && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean'
-      ? cached.hotResult
-      : null;
-
   const entry = {
     expiresAt: Infinity,
-    hotResult: preservedHot,
+    hotResult: null,
     hotPromise: null,
     promise: null,
     consumers: new Set(isRelevant ? [isRelevant] : []),
@@ -907,37 +928,46 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
   const needed = () =>
     !blockedAuthors.has(key) && (entry.unscoped || [...entry.consumers].some((check) => check()));
 
-  if (preservedHot) {
-    entry.hotPromise = Promise.resolve(preservedHot);
-  } else {
-    entry.hotPromise = checkListingHasPosts(
-      `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=hot&include_over_18=on&raw_json=1`,
-      entry.priority,
-      needed,
-      { authorKey: key, priorityQueue: entry.priority }
-    ).then(
-      (value) => {
-        const res = { hasHot: value, hotError: '', retryable: false };
-        entry.hotResult = res;
-        syncAuthorListingButtonsInDom(author, { hasHot: value, hotError: '' });
-        return res;
-      },
-      (error) => {
-        if (error instanceof CancelledCheck) return { cancelled: true };
-        if (error instanceof RequestError && error.status === 404) {
-          const res404 = { hasHot: false, hotError: '', retryable: false, emptyProfile: true };
-          entry.hotResult = res404;
-          syncAuthorListingButtonsInDom(author, { hasHot: false, hotError: '' });
-          return res404;
-        }
-        return {
-          hasHot: null,
-          hotError: error.message,
-          retryable: error.retryable,
-        };
+  // A single query to submitted.json?limit=5&sort=hot determines whether the user has any visible
+  // submitted posts on their profile (both /submitted/?sort=hot and /submitted/?sort=top&t=all
+  // render the exact same user submission pool).
+  entry.hotPromise = checkListingHasPosts(
+    `${location.origin}/user/${encoded}/submitted.json?limit=5&sort=hot&raw_json=1`,
+    entry.priority,
+    needed,
+    { authorKey: key, priorityQueue: entry.priority }
+  ).then(
+    (value) => {
+      const res = { hasHot: value, hotError: '', retryable: false };
+      entry.hotResult = res;
+      syncAuthorListingButtonsInDom(author, {
+        hasHot: value,
+        hotError: '',
+        hasTop: value,
+        topError: '',
+      });
+      return res;
+    },
+    (error) => {
+      if (error instanceof CancelledCheck) return { cancelled: true };
+      if (error instanceof RequestError && (error.status === 404 || error.status === 403)) {
+        const resEmpty = { hasHot: false, hotError: '', retryable: false, emptyProfile: true };
+        entry.hotResult = resEmpty;
+        syncAuthorListingButtonsInDom(author, {
+          hasHot: false,
+          hotError: '',
+          hasTop: false,
+          topError: '',
+        });
+        return resEmpty;
       }
-    );
-  }
+      return {
+        hasHot: null,
+        hotError: error.message,
+        retryable: error.retryable,
+      };
+    }
+  );
 
   if (onHot) {
     entry.hotPromise.then((hot) => {
@@ -948,38 +978,11 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
   entry.promise = entry.hotPromise
     .then(async (hot) => {
       if (hot.cancelled) return hot;
-      let top;
-      if (hot.hasHot === true) {
-        // A visible submitted post also belongs to the all-time top listing.
-        top = { hasTop: true, topError: '', retryable: false };
-      } else if (hot.emptyProfile) {
-        top = { hasTop: false, topError: '', retryable: false };
-      } else if (hot.hasHot === null) {
-        top = { hasTop: null, topError: hot.hotError, retryable: hot.retryable };
-      } else {
-        try {
-          top = {
-            hasTop: await checkListingHasPosts(
-              `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=top&t=all&include_over_18=on&raw_json=1`,
-              true,
-              needed,
-              { authorKey: key, priorityQueue: true, continuation: true }
-            ),
-            topError: '',
-            retryable: false,
-          };
-        } catch (error) {
-          if (error instanceof CancelledCheck) {
-            return { cancelled: true, hotPreserved: true, hasHot: hot.hasHot, hotError: '' };
-          }
-          if (error instanceof RequestError && error.status === 404) {
-            top = { hasTop: false, topError: '', retryable: false };
-          } else {
-            top = { hasTop: null, topError: error.message, retryable: error.retryable };
-          }
-        }
-      }
-      const failed = hot.hasHot === null || top.hasTop === null;
+      const failed = hot.hasHot === null;
+      const top = failed
+        ? { hasTop: null, topError: hot.hotError, retryable: hot.retryable }
+        : { hasTop: Boolean(hot.hasHot), topError: '', retryable: false };
+
       entry.expiresAt = Math.max(
         Date.now() + (failed ? FAILURE_TTL_MS : STATUS_TTL_MS),
         failed ? rateLimitedUntil : 0
@@ -1000,22 +1003,13 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
         entry.settledStatus = result;
         syncAuthorListingButtonsInDom(author, result);
         schedulePersistAuthorCache();
-      } else if (typeof hot.hasHot === 'boolean') {
-        syncAuthorListingButtonsInDom(author, { hasHot: hot.hasHot, hotError: '' });
-        schedulePersistAuthorCache();
       }
       return result;
     })
     .then((status) => {
       entry.consumers.clear();
-      if (status.cancelled) {
-        if (entry.hotResult && typeof entry.hotResult.hasHot === 'boolean') {
-          entry.expiresAt = Date.now() + STATUS_TTL_MS;
-          entry.promise = null;
-          schedulePersistAuthorCache();
-        } else if (authorCache.get(key) === entry) {
-          authorCache.delete(key);
-        }
+      if (status.cancelled && authorCache.get(key) === entry) {
+        authorCache.delete(key);
       }
       return status;
     });
@@ -1035,6 +1029,16 @@ function renderListingState(btn, hasPosts, label, emptyLabel, error) {
   }
 }
 
+function isWrapOrPostNearby(wrap) {
+  if (!wrap || !wrap.isConnected) return false;
+  if (wrap.dataset.nearby === 'true' || wrap.dataset.postNearby === 'true') return true;
+  const target = wrap.closest(POST_SELECTOR) || wrap;
+  if (typeof target.getBoundingClientRect !== 'function') return false;
+  const rect = target.getBoundingClientRect();
+  const viewH = window.innerHeight || document.documentElement?.clientHeight || 800;
+  return rect.bottom >= -PREFETCH_MARGIN_PX && rect.top <= viewH + PREFETCH_MARGIN_PX;
+}
+
 async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
   const author = wrap.dataset.author;
   if (!author || blockedAuthors.has(author.toLowerCase())) return;
@@ -1052,16 +1056,16 @@ async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
       (hot) => {
         if (wrap.isConnected && wrap.dataset.author === author) {
           renderListingState(postsBtn, hot.hasHot, 'Posts', 'No posts', hot.hotError);
+          if (typeof hot.hasHot === 'boolean') {
+            renderListingState(topBtn, hot.hasHot, 'Top posts', 'No top', hot.hotError);
+          }
         }
       },
-      () => wrap.isConnected && wrap.dataset.author === author && wrap.dataset.nearby === 'true',
+      () => wrap.isConnected && wrap.dataset.author === author && isWrapOrPostNearby(wrap),
       priority
     );
     if (status.cancelled) {
       cancelled = true;
-      if (typeof status.hasHot === 'boolean' && wrap.isConnected && wrap.dataset.author === author) {
-        renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError || '');
-      }
       return;
     }
     if (!wrap.isConnected || wrap.dataset.author !== author) return;
@@ -1086,7 +1090,7 @@ async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
 }
 
 function requestVisibleStatus(wrap) {
-  if (!wrap.isConnected || document.visibilityState === 'hidden' || wrap.dataset.nearby !== 'true')
+  if (!wrap.isConnected || document.visibilityState === 'hidden' || !isWrapOrPostNearby(wrap))
     return;
   const key = (wrap.dataset.author || '').toLowerCase();
   if (!key || blockedAuthors.has(key)) return;
@@ -1100,13 +1104,7 @@ function requestVisibleStatus(wrap) {
     wrap.dataset.statusRequested = 'true';
     return;
   }
-  const hasIncompleteHot =
-    cached && !cached.settledStatus && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean';
-  if (
-    wrap.dataset.statusRequested === 'true' &&
-    wrap.dataset.retryReady !== 'true' &&
-    !hasIncompleteHot
-  ) {
+  if (wrap.dataset.statusRequested === 'true' && wrap.dataset.retryReady !== 'true') {
     return;
   }
   wrap.dataset.statusRequested = 'true';
@@ -1122,31 +1120,46 @@ function clearDwellTimer(wrap) {
   }
 }
 
+function handleVisibilityChangeForWrap(wrap, isIntersecting, fromPost = false) {
+  if (!wrap) return;
+  if (fromPost) {
+    wrap.dataset.postNearby = String(isIntersecting);
+  } else {
+    wrap.dataset.nearby = String(isIntersecting);
+  }
+  const active = wrap.dataset.nearby === 'true' || wrap.dataset.postNearby === 'true';
+  if (!active) {
+    clearDwellTimer(wrap);
+    return;
+  }
+  const key = (wrap.dataset.author || '').toLowerCase();
+  const cached = authorCache.get(key);
+  if (cached && cached.expiresAt > Date.now() && cached.settledStatus) {
+    clearDwellTimer(wrap);
+    requestVisibleStatus(wrap);
+    return;
+  }
+  if (!dwellTimers.has(wrap)) {
+    const timer = setTimeout(() => {
+      dwellTimers.delete(wrap);
+      if (wrap.isConnected && isWrapOrPostNearby(wrap)) {
+        requestVisibleStatus(wrap);
+      }
+    }, VIEWPORT_DWELL_MS);
+    dwellTimers.set(wrap, timer);
+  }
+}
+
 const visibilityObserver = new IntersectionObserver(
   (entries) => {
     entries.forEach((entry) => {
-      const wrap = entry.target;
-      wrap.dataset.nearby = String(entry.isIntersecting);
-      clearDwellTimer(wrap);
-
-      if (entry.isIntersecting) {
-        const key = (wrap.dataset.author || '').toLowerCase();
-        const cached = authorCache.get(key);
-        if (
-          cached &&
-          cached.expiresAt > Date.now() &&
-          cached.expiresAt !== Infinity &&
-          (cached.settledStatus || cached.hotResult)
-        ) {
-          requestVisibleStatus(wrap);
-        } else {
-          const timer = setTimeout(() => {
-            dwellTimers.delete(wrap);
-            if (wrap.isConnected && wrap.dataset.nearby === 'true') {
-              requestVisibleStatus(wrap);
-            }
-          }, VIEWPORT_DWELL_MS);
-          dwellTimers.set(wrap, timer);
+      const target = entry.target;
+      if (target.classList?.contains(WRAP_CLASS)) {
+        handleVisibilityChangeForWrap(target, entry.isIntersecting, false);
+      } else {
+        const wrap = postToWrapMap.get(target) || findOwnWrap(target);
+        if (wrap) {
+          handleVisibilityChangeForWrap(wrap, entry.isIntersecting, true);
         }
       }
     });
@@ -1157,7 +1170,7 @@ const visibilityObserver = new IntersectionObserver(
 
 function normalizeAuthor(raw) {
   if (!raw) return '';
-  return raw.trim().replace(/^u\//i, '');
+  return raw.trim().replace(/^(?:\/?(?:u|user)\/)/i, '');
 }
 
 function extractAuthorId(post, modern) {
@@ -1208,12 +1221,10 @@ function applyCachedAuthorStatusToWrap(wrap, author) {
     renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
     renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
     wrap.dataset.statusRequested = 'true';
-  } else if (cached.hotResult && typeof cached.hotResult.hasHot === 'boolean') {
-    renderListingState(postsBtn, cached.hotResult.hasHot, 'Posts', 'No posts', '');
   }
 }
 
-function createBtnGroup(author, authorId) {
+function createBtnGroup(author, authorId, post = null) {
   const encoded = encodeURIComponent(author);
   const wrap = document.createElement('span');
   wrap.className = WRAP_CLASS;
@@ -1238,6 +1249,10 @@ function createBtnGroup(author, authorId) {
   applyCachedAuthorStatusToWrap(wrap, author);
 
   visibilityObserver.observe(wrap);
+  if (post) {
+    postToWrapMap.set(post, wrap);
+    visibilityObserver.observe(post);
+  }
 
   const checkOnIntent = () => {
     clearDwellTimer(wrap);
@@ -1247,14 +1262,10 @@ function createBtnGroup(author, authorId) {
       return;
     }
     const entry = authorCache.get(key);
-    if (
-      wrap.dataset.statusRequested === 'true' &&
-      entry &&
-      entry.settledStatus &&
-      entry.expiresAt > Date.now()
-    ) {
+    if (entry && entry.settledStatus && entry.expiresAt > Date.now()) {
       renderListingState(postsBtn, entry.settledStatus.hasHot, 'Posts', 'No posts', '');
       renderListingState(topBtn, entry.settledStatus.hasTop, 'Top posts', 'No top', '');
+      wrap.dataset.statusRequested = 'true';
       return;
     }
     wrap.dataset.statusRequested = 'true';
@@ -1273,6 +1284,15 @@ document.addEventListener('visibilitychange', () => {
     document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
       visibilityObserver.unobserve(wrap);
       visibilityObserver.observe(wrap);
+      const post = wrap.closest(POST_SELECTOR);
+      if (post) {
+        postToWrapMap.set(post, wrap);
+        visibilityObserver.unobserve(post);
+        visibilityObserver.observe(post);
+      }
+      if (isWrapOrPostNearby(wrap)) {
+        requestVisibleStatus(wrap);
+      }
     });
   } else {
     persistAuthorCacheToSession();
@@ -1299,8 +1319,6 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
           const entry = authorCache.get(lower);
           if (entry?.settledStatus) {
             syncAuthorListingButtonsInDom(lower, entry.settledStatus);
-          } else if (entry?.hotResult) {
-            syncAuthorListingButtonsInDom(lower, entry.hotResult);
           }
         }
       } catch {
@@ -1357,24 +1375,35 @@ function processPost(post) {
 
   const existing = findOwnWrap(post);
   if (existing) {
-    if (existing.dataset.author === author && existing.dataset.authorId === authorId) {
+    if (existing.dataset.author === author) {
+      if (authorId && existing.dataset.authorId !== authorId) {
+        existing.dataset.authorId = authorId;
+      }
+      postToWrapMap.set(post, existing);
       applyCachedAuthorStatusToWrap(existing, author);
       if (detachedWraps.has(existing)) {
         detachedWraps.delete(existing);
         visibilityObserver.observe(existing);
+        visibilityObserver.observe(post);
+      }
+      if (isWrapOrPostNearby(existing)) {
+        requestVisibleStatus(existing);
       }
       return;
     }
     clearDwellTimer(existing);
     existing.dataset.nearby = 'false';
+    existing.dataset.postNearby = 'false';
     visibilityObserver.unobserve(existing);
+    visibilityObserver.unobserve(post);
+    postToWrapMap.delete(post);
     existing.remove();
     processQueue();
   }
 
   if (!author || author === '[deleted]' || !bar) return;
 
-  const wrap = createBtnGroup(author, authorId);
+  const wrap = createBtnGroup(author, authorId, post);
   if (modern) {
     post.style.isolation = 'isolate';
     bar.style.display = 'flex';
@@ -1392,7 +1421,11 @@ function processPost(post) {
   } else {
     bar.appendChild(wrap);
   }
+
   if (blockedAuthors.has(author.toLowerCase())) dimPost(post);
+  if (isWrapOrPostNearby(wrap)) {
+    handleVisibilityChangeForWrap(wrap, true, true);
+  }
 }
 
 let rafScheduled = false;
@@ -1423,6 +1456,7 @@ function scheduleProcessPosts(mutations) {
       const detach = (wrap) => {
         clearDwellTimer(wrap);
         wrap.dataset.nearby = 'false';
+        wrap.dataset.postNearby = 'false';
         visibilityObserver.unobserve(wrap);
         detachedWraps.add(wrap);
         detached = true;
