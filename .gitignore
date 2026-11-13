@@ -7,3 +7,9 @@ Thumbs.db
 *.pem
 .idea/
 .vscode/
+
+# Environments and secrets
+.env
+.env.*
+!.env.example
+
