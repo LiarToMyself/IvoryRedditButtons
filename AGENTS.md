@@ -10,9 +10,9 @@ Drop-in operating instructions for coding agents. Read this file before every ta
 
 These rules override everything else in this file when in conflict:
 
-1. **No flattery, no filler.** Skip openers like "Great question", "You're absolutely right", "Excellent idea", "I'd be happy to". Start with the answer or the action.
+1. **No flattery, no filler.** Skip openers like "Great question", "You're absolutely right", "Excellent idea", "I'd be happy to". Start with the answer.
 2. **Disagree when you disagree.** If the user's premise is wrong, say so before doing the work. Agreeing with false premises to be polite is the single worst failure mode in coding agents.
-3. **Never fabricate.** Not file paths, not commit hashes, not API names, not test results, not library functions. If you don't know, read the file, run the command, or say "I don't know, let me check."
+3. **Never fabricate.** Never. Not file paths, not commit hashes, not API names, not test results, not library functions. If you don't know, read the file, run the command, or say "I don't know, let me check."
 4. **Stop when confused.** If the task has two plausible interpretations, ask. Do not pick silently and proceed.
 5. **Touch only what you must.** No drive-by refactors, reformatting, or "while I was in there" cleanups.
 
@@ -23,7 +23,7 @@ These rules override everything else in this file when in conflict:
 **Goal: understand the problem and the codebase before producing a diff.**
 
 - State your plan in one or two sentences before editing. For anything non-trivial, produce a numbered list of steps with a verification check for each.
-- Read the files you will touch. Read the files that call the files you will touch. Gemini: use subagents for exploration so the main context stays clean.
+- Read the files you will touch. Read the files that call the files you will touch. Use subagents for exploration so the main context stays clean.
 - Match existing patterns in the codebase. If the project uses pattern X, use pattern X, even if you'd do it differently in a greenfield repo.
 - Surface assumptions out loud: "I'm assuming you want X, Y, Z. If that's wrong, say so." Do not bury assumptions inside the implementation.
 - If two approaches exist, present both with tradeoffs. Do not pick one silently. Exception: trivial tasks (typo, rename, log line) where the diff fits in one sentence.
@@ -66,7 +66,7 @@ The test: every changed line traces directly to the user's request. If a line fa
 Rewrite vague asks into verifiable goals before starting:
 
 - "Add validation" becomes "Write tests for invalid inputs (empty, malformed, oversized), then make them pass."
-- "Fix the bug" becomes "Write a failing test that reproduces the reported symptom, then make them pass."
+- "Fix the bug" becomes "Write a failing test that reproduces the reported symptom, then make it pass."
 - "Refactor X" becomes "Ensure the existing test suite passes before and after, and no public API changes."
 - "Make it faster" becomes "Benchmark the current hot path, identify the bottleneck with profiling, change it, show the benchmark is faster."
 
@@ -85,10 +85,10 @@ For every task:
 - Never report "done" based on a plausible-looking diff alone. Plausibility is not correctness.
 - When debugging, address root causes, not symptoms. Suppressing the error is not fixing the error.
 - For UI changes, verify visually: screenshot before, screenshot after, describe the diff.
-- Use CLI tools (gh, aws, gcloud, kubectl) when they exist. They are more context-efficient than reading docs or hitting APIs unauthenticated.
+- Use CLI tools (gh, py, agy, aws, kubectl) when they exist. They are more context-efficient than reading docs or hitting APIs unauthenticated.
 - When reading logs, errors, or stack traces, read the whole thing. Half-read traces produce wrong fixes.
 - Put all build outputs, extra scripts and debug dumps into `<project-root>/artifacts/`.
-- Look up today's real date and the freshest project stack versions on the web before starting every task; never use or trust old model data.
+- Look up today's real date and the freshest project stack versions on the web before starting every task; prefer not to trust old model data.
 
 ---
 
@@ -96,9 +96,9 @@ For every task:
 
 - Context is the constraint. Long sessions with accumulated failed attempts perform worse than fresh sessions with a better prompt.
 - After two failed corrections on the same issue, stop. Summarize what you learned and ask the user to reset the session with a sharper prompt.
-- Use subagents (Gemini: "use subagents to investigate X") for exploration tasks that would otherwise pollute the main context with dozens of file reads.
-- When committing or updating changelog, write descriptive commit messages (subject under 72 chars, body explains the why). No "update file" or "fix bug" commits. No "Co-Authored-By: Gemini" attribution unless the project explicitly wants it.
-- Write patch notes and public text in simple language: no words longer than 12 letters. If a word is long, break it into small, plain words.
+- Use subagents if asked for exploration tasks that would otherwise pollute the main context with dozens of file reads.
+- When committing, write descriptive commit messages (subject under 72 chars, body explains the why). No "update file" or "fix bug" commits. No "Co-Authored-By:" attribution unless the project explicitly wants it. Commit code per file or function; bundle all docs for the same task in one docs commit, not one commit per doc.
+- Write changelogs and public text in simple language.
 
 ---
 
@@ -109,6 +109,8 @@ For every task:
 - When a question has a clear answer, give it. When it does not, say so and give your best read on the tradeoffs.
 - Celebrate only what matters: shipping, solving genuinely hard problems, metrics that moved. Not feature ideas, not scope creep, not "wouldn't it be cool if".
 - No excessive bullet points, no unprompted headers, no emoji. Prose is usually clearer than structure for short answers.
+- Do not use em dashes in documentation or replies; use hyphens.
+- Do not use AI tables in replies.
 
 ---
 
@@ -122,7 +124,7 @@ For every task:
 
 **Proceed without asking when:**
 - The task is trivial and reversible (typo, rename a local variable, add a log line).
-- The ambiguity can be resolved by reading the code or running a command.
+- The ambiguity can be resolved by reading the code.
 - The user has already answered the question once in this session.
 
 ---
@@ -144,41 +146,43 @@ After every session where the agent did something wrong:
 
 ### Stack
 - Language and version: Vanilla JavaScript (ES2022+ / Web APIs)
-- Framework(s): Pure Vanilla JS (No build step, no npm/bundler frameworks, Chrome Extensions MV3)
-- Package manager: None (Direct browser execution)
-- Runtime / deployment target: Google Chrome / Chromium-based browsers (Manifest V3, Shreddit and Old Reddit DOM)
-- VCS / Remote: Private GitHub repository (`https://github.com/LiarToMyself/IvoryRedditButtons`) via GitHub MCP and local Git CLI
-- Branch strategy: `dev` is default branch for active integration; `main` is protected release baseline. Direct pushes to `main` are strictly forbidden. Feature work in `feat/vX.Y.Z` or versioned feature branches (e.g. `v1.4.3-gemini-3.8FH`) with atomic, granular commits per logical diff. Remote operations (branches, PRs, merges) managed via `github-mcp-server`.
-- Versioning: SemVer 2.0.0 via standard Git tags (`vX.Y.Z`) and GitHub Releases. Releases are tagged with annotated Git tags (`git tag -a vX.Y.Z -m "Release vX.Y.Z"`).
+- Framework(s): Pure Vanilla JS (Chrome Extensions MV3)
+- Runtime / deployment target: Google Chrome / Chromium-based browsers (Manifest V3)
+- VCS / Remote: Private GitHub repository (`LiarToMyself/IvoryRedditButtons`) via GitHub MCP and local Git CLI
+- Branch strategy: `dev` is default for active work; `main` is locked base. Direct pushes to `main` or `dev` are banned. Tree: `dev` -> `vX.Y.Z` (version) -> `vX.Y.Z-<model>` (model) -> `vX.Y.Z-<model>-<feature>` (feature in worktree). Remote ops via `github-mcp-server`.
+- Versioning: SemVer 2.0.0 via standard Git tags `vX.Y.Z` and GitHub Releases. Releases are tagged with annotated Git tags (`git tag -a vX.Y.Z -m "Release vX.Y.Z"`).
 
 ### Commands
 - Install: Open `chrome://extensions/` in Chrome -> Enable Developer mode -> Click "Load unpacked" -> Select repository directory
-- Build: None (interpreted directly by browser engine)
-- Test (all): `node --check content.js` for syntax validation; manual live test on Reddit feeds and profile pages
-- Test (single file): `node --check content.js`
-- Lint: ESLint / vanilla JavaScript linter if configured
-- Typecheck: None (Vanilla JS / JSDoc)
 - Run locally: Reload unpacked extension at `chrome://extensions/` and refresh Reddit tab (`Ctrl+R` / `F5`)
-
-Prefer single-file or single-test runs during iteration. Full suites are for the final verification pass.
+- Check hygiene: `python .agents/hooks/check_source_hygiene.py`
+- New branch: `git checkout -b <branch> <base>`
+- Commit: `git commit -m "<type>(<scope>): <summary>" -m "Why: <rationale>"`
+- Sync: `git fetch origin && git rebase origin/<base>`
+- Push branch: `git push -u origin <branch>`
+- View Issue (GitHub MCP): `call_mcp_tool github-mcp-server issue_read` (method: `get`)
+- Create Issue (GitHub MCP): `call_mcp_tool github-mcp-server issue_write` (method: `create`)
+- Create PR (GitHub MCP): `call_mcp_tool github-mcp-server create_pull_request`
+- Run CI (GitHub MCP): `call_mcp_tool github-mcp-server actions_run_trigger` (method: `run_workflow`, `workflow_id: "ci.yml"`)
+- Release tag: `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+- Push tag: `git push origin vX.Y.Z`
+- Backup: `powershell -NoProfile -ExecutionPolicy Bypass -Command '$d = "<backup-dir>"; if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force }; $n = Join-Path $d ("IvoryRedditButtons_" + (Get-Date -Format "yyyy-MM-dd_HH-mm") + ".tar"); $i = (Get-ChildItem -Force | Where-Object { $_.Name -notin @("artifacts","logs",".git",".vscode") } | ForEach-Object { $_.Name }); tar -cf $n @i'`
+- Backup codebase: `powershell -NoProfile -ExecutionPolicy Bypass -Command '$d = "<backup-dir>"; if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force }; $n = Join-Path $d ("IvoryRedditButtons_Codebase_" + (Get-Date -Format "yyyy-MM-dd_HH-mm") + ".tar"); tar -cf $n manifest.json content.js'`
+- Hook setup: `git config core.hooksPath .githooks`
 
 ### Layout
-- Source lives in: `./` (`manifest.json`, `content.js`, `icon.png`)
-- Tests live in: `tests/`, `artifacts/tests/`
-- Logs live in: `logs/`
+- Source lives in: `./` (`manifest.json`, `content.js`)
+- Assets live in: `assets/`
 - Screenshots live in: `screenshots/`
-- Do not modify: `icon.png`, `.env.example`
+- Documentation: `README.md`, `EngineBlueprint.md` (layer design and exact logic), `CHANGELOG.md` (version history read by release workflow), `plans/` (plans and checklists).
 
 ### Conventions specific to this repo
-- Naming: camelCase for variables/functions, UPPER_SNAKE_CASE for constants, PascalCase for classes; standard placeholders `<project-root>`, `<desktop>`; zero host-absolute paths.
-- Import style: None (single-file content script `content.js` loaded directly via `manifest.json`)
-- Error handling pattern: Graceful degradation, try/catch with `console.warn`/`console.error`, strict adherence to Reddit rate limits (`429`), network backoff.
-- Testing pattern and framework: Syntax check via `node --check content.js`; in-browser live UI and network inspection via Chrome DevTools.
+- Naming: `TODO` (standard placeholders `<project-root>`, `<app-version>`, `<target-project>`, `<desktop>`; zero host-absolute paths)
 - Screenshots: Save user chat UI captures in `screenshots/vX.Y.Z_YYYY-MM-DD_HH-mm.<ext>`
 
 ### Forbidden
-- Calling merge_pull_request or merging any pull request or branch into dev or main. Merging is strictly reserved for the human developer.
 - Direct pushes to main or dev branches.
+- Reading backups or replacing existing files with backup files.
 
 ---
 
@@ -188,11 +192,12 @@ Prefer single-file or single-test runs during iteration. Full suites are for the
 
 When the user corrects your approach, append a one-line rule here before ending the session. Write it concretely ("Always use X for Y"), never abstractly ("be careful with Y"). If an existing line already covers the correction, tighten it instead of adding a new one. Remove lines when the underlying issue goes away (model upgrades, refactors, process changes).
 
-- Always respect Reddit API and HTML page rate limits: never spam unauthenticated requests or background fetch without strict backoff and rate-limit headers inspection.
-- Reddit user profile pages can be hidden, empty, or restricted by user privacy settings (e.g., hidden post history or NSFW/suspended accounts); handle 404, 403, and empty listings distinctly.
-- Never block the browser UI thread or cause HTTP 429 lockouts for the user across open tabs.
-- Cross-tab pacing must be globally enforced via localStorage timestamps to prevent multi-tab burst amplification on Reddit endpoints.
-- Parse Fastly/Envoy proxy headers defensively (split comma, parseFloat) to prevent NaN rate-limit bypasses.
-- Use a safe 600s fallback backoff on HTTP 429 when Retry-After is absent to avoid resetting Reddit's penalty timer.
-- Query author submissions atomically (a single request accurately determines both hot and top emptiness, eliminating two-phase race conditions).
-- Never remove and recreate button containers during asynchronous <shreddit-post> author-id hydration; update dataset attributes in-place.
+- EngineBlueprint.md must never duplicate AGENTS.md or any agent rules. It is an architecture blueprint split into clean sections by layer. It is written in a code-comment-like style for each function and loop, explaining exact formulas, exact UI design, exact logic, and why each part exists, so a human can understand every algorithm and rebuild an exact copy of the project on any stack without looking at the code.
+- Fix tasks and track bugs via GitHub issues. Read tasks, file side bugs using commands from 10. Project context of these agent rules.
+- When asked for a PR, call command Create PR from 10. Project context of these agent rules. Claim success only after a PR URL is returned. Link PR with "Fixes #<>" or "Closes #<>".
+- While coding, write microreports in the relevant feature folder under plans/code-micro-reports/ after each code step and commit it. Update its index. State the bug, the changed files, why the change helps, and what still needs a manual check. Use plain prose and GitHub links. Do not create empty plans ahead of work.
+- Prefix new document names in plans/ with their creation date in YYYY-MM-DD- format. Keep the existing numbering for code microreports. Keep plans/plan-index.md in sync with the plans/ catalog.
+
+---
+
+Read once. Edit sections 10 and 11 for your project. Prune the rest over time. This file gets better the more you use it.
