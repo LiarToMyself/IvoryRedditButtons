@@ -125,7 +125,10 @@
           if (lowQuota) rate.pausedUntil = Math.max(rate.pausedUntil, now + (Number.isFinite(reset) && reset > 0 ? Math.min(reset, 120) : 60) * 1000);
         });
       }
-      if (!res.ok) { const e = new Error(`Reddit HTTP ${res.status}`); e.status = res.status; throw e; }
+      if (!res.ok) {
+        if (MISSING_USER_RE.test(text)) { const e = new Error('Missing user'); e.status = 404; e.settledEmpty = true; throw e; }
+        const e = new Error(`Reddit HTTP ${res.status}`); e.status = res.status; throw e;
+      }
       if (res.redirected) {
         const o = new URL(url, location.origin), d = new URL(res.url, location.origin);
         if (o.origin !== d.origin || !/^\/(?:(?:user|u)\/[^/]+\/(?:submitted|about)\.json|api\/me\.json|svc\/shreddit\/profiles\/profile_posts-more-posts\/(?:top|hot)\/?)$/i.test(d.pathname)) throw new Error('Unexpected redirect');
@@ -172,7 +175,7 @@
       } catch (err) {
         if (err.status === 429 || err.settledEmpty) throw err;
         const has = parseJsonListing(await fetchJson(jsonUrl, {}, true));
-        if (err.status === 404 || err.status === 406 || err.status === 403) partialBroken = true;
+        if (err.status === 406) partialBroken = true;
         return has;
       }
     }
@@ -194,7 +197,7 @@
         ? Math.max(rate.pausedUntil, rate.lastReqAt + CFG.hoverGapMs * scale)
         : Math.max(rate.pausedUntil, tabReadyAt, rate.nextBgAt)
     );
-    const maxMin = (isPri || isStep2) ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
+    const maxMin = (isPri && isStep2) ? (slow ? 5 : CFG.totalMaxPerMin + 1) : (isPri || isStep2) ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
     const max10m = (isPri || isStep2) ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
     const inMin = rate.ts.filter((t) => t > now - 60000);
     if (inMin.length >= maxMin) until = Math.max(until, inMin[inMin.length - maxMin] + 60050);
@@ -212,7 +215,7 @@
     if (authorCache.get(key)?.expiresAt > now) { syncDom(key); return; }
     if (!priority && (retryAfter.get(key) || 0) > now) return;
     if (priority) retryAfter.delete(key);
-    queue.set(key, { author, priority: Boolean(priority || queue.get(key)?.priority), seq: ++seq });
+    queue.set(key, { author, priority: Boolean(priority || queue.get(key)?.priority), step2: Boolean(queue.get(key)?.step2 || partialTopFalse.has(key)), seq: ++seq });
     pumpQueue();
   }
   const isNearby = (key) => [...document.querySelectorAll(`.${WRAP}`)].some((w) => (w.dataset.author || '').toLowerCase() === key && w.dataset.nearby === 'true');
@@ -251,7 +254,7 @@
           if (partialHotTrue.has(key)) { setStatus(key, true, false); return; }
           partialTopFalse.add(key); syncDom(key);
           // Step-2 for same author runs chained with short gap and cannot be pruned on scroll.
-          queue.set(key, { author: item.author, priority: item.priority, step2: true, seq: ++seq });
+          queue.set(key, { author: item.author, priority: Boolean(item.priority || queue.get(key)?.priority), step2: true, seq: ++seq });
         } else setStatus(key, Boolean(await fetchListingHasPosts(item.author, 'hot')), false);
       } catch (err) {
         if (err.status === 404 || err.status === 403) setStatus(key, false, false);
