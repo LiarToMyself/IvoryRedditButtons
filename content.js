@@ -437,7 +437,9 @@
     const authorId = /^t2_[a-z0-9]+$/i.test(directId) ? directId : [...post.querySelectorAll('[author-id],[data-author-fullname]')].map((el) => (el.closest(POST_SEL) === post ? el.getAttribute('author-id') || el.getAttribute('data-author-fullname') : '')).find((v) => /^t2_[a-z0-9]+$/i.test(v || '')) || '';
     const pageOwnerMatch = location.pathname.match(/^\/(?:user|u)\/([^/?#]+)/i);
     const pageOwner = pageOwnerMatch ? safeDecode(pageOwnerMatch[1]).toLowerCase() : '';
-    const prof = !isNested ? getProfileCtx() : null, isOwnerSubmitted = Boolean(prof && prof.owner === key), noAuto = isNested || (pageOwner ? pageOwner === key : isOwnerSubmitted);
+    const prof = !isNested ? getProfileCtx() : null;
+    const isOwnerSubmitted = Boolean(prof && prof.owner === key && (prof.tab === 'submitted' || prof.tab === 'posts'));
+    const noAuto = isNested || (pageOwner ? pageOwner === key : isOwnerSubmitted);
     const existing = findOwnWrap(post);
     if (existing) {
       if (existing.dataset.author === author) {
@@ -490,7 +492,7 @@
     (n.matches(POST_SEL) ? [n, ...n.querySelectorAll(POST_SEL)] : [...n.querySelectorAll(POST_SEL)]).forEach((p) => { observer.unobserve(p); postToWrap.delete(p); });
   };
   let lastUrl = location.href;
-  const onNav = () => { if (location.href !== lastUrl) { lastUrl = location.href; setTimeout(() => ready.then(seedEmptyProfileIfReady), CFG.settleMs); } };
+  const onNav = () => { if (location.href !== lastUrl) { lastUrl = location.href; seedEmptyProfileIfReady(); } };
   window.addEventListener('popstate', onNav);
   document.querySelectorAll(POST_SEL).forEach(processPost);
   setTimeout(() => ready.then(seedEmptyProfileIfReady), CFG.settleMs);
@@ -504,7 +506,7 @@
         m.removedNodes?.forEach(cleanupRemoved); m.addedNodes?.forEach(collect);
       }
       const hasEmpty = muts.some((m) => [...(m.addedNodes || [])].some((n) => n.nodeType === 1 && (n.matches?.('shreddit-empty-state, [data-testid="empty-state"]') || n.querySelector?.('shreddit-empty-state, [data-testid="empty-state"]'))));
-      if (hasEmpty) setTimeout(() => ready.then(seedEmptyProfileIfReady), 100);
+      if (hasEmpty) seedEmptyProfileIfReady();
       if (raf || !pending.size) return;
       raf = true;
       requestAnimationFrame(() => { raf = false; const list = [...pending]; pending.clear(); list.forEach(processPost); seedEmptyProfileIfReady(); });
