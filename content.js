@@ -180,12 +180,13 @@
   }
 
   // ---- Layer 3: Scheduler & Non-Destructive Top -> Hot Cascade ----
-  function blockedUntil(priority, now) {
+  function blockedUntil(item, now) {
     rate.ts = pruneTs(rate.ts, now);
     const slow = rate.slowUntil > now, scale = slow ? 2 : 1;
-    let until = Math.max(rate.limitedUntil, priority ? (rate.lastReqAt ? rate.lastReqAt + CFG.hoverGapMs * scale : 0) : Math.max(rate.pausedUntil, tabReadyAt, rate.nextBgAt));
-    const maxMin = priority ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
-    const max10m = priority ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
+    const isPri = Boolean(item?.priority), isStep2 = Boolean(item?.step2);
+    let until = Math.max(rate.limitedUntil, isPri ? (rate.lastReqAt ? rate.lastReqAt + CFG.hoverGapMs * scale : 0) : isStep2 ? Math.max(rate.pausedUntil, rate.lastReqAt + CFG.hoverGapMs * scale) : Math.max(rate.pausedUntil, tabReadyAt, rate.nextBgAt));
+    const maxMin = isPri ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
+    const max10m = isPri ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
     const inMin = rate.ts.filter((t) => t > now - 60000);
     if (inMin.length >= maxMin) until = Math.max(until, inMin[inMin.length - maxMin] + 60050);
     if (rate.ts.length >= max10m) until = Math.max(until, rate.ts[rate.ts.length - max10m] + 600050);
@@ -205,7 +206,7 @@
     pumpQueue();
   }
   const isNearby = (key) => [...document.querySelectorAll(`.${WRAP}`)].some((w) => (w.dataset.author || '').toLowerCase() === key && w.dataset.nearby === 'true');
-  const pruneQueue = (now) => { for (const [k, item] of queue) if (blocked.has(k) || authorCache.get(k)?.expiresAt > now || (!item.priority && !isNearby(k))) queue.delete(k); };
+  const pruneQueue = (now) => { for (const [k, item] of queue) if (blocked.has(k) || authorCache.get(k)?.expiresAt > now || (!item.priority && !item.step2 && !isNearby(k))) queue.delete(k); };
 
   function pumpQueue() {
     if (queueTimer) { clearTimeout(queueTimer); queueTimer = null; }
@@ -220,15 +221,15 @@
           pruneQueue(now);
           let pickKey = '', best = -Infinity, minWait = Infinity;
           for (const [k, item] of queue) {
-            const wait = blockedUntil(item.priority, now) - now;
-            if (wait <= 0) { const sc = (item.priority ? 1e9 : 0) + item.seq; if (sc > best) { best = sc; pickKey = k; } }
+            const wait = blockedUntil(item, now) - now;
+            if (wait <= 0) { const sc = (item.priority ? 1e9 : 0) + (item.step2 ? 1e6 : 0) + item.seq; if (sc > best) { best = sc; pickKey = k; } }
             else if (wait < minWait) minWait = wait;
           }
           if (!pickKey) return { dirty: false, wait: minWait };
           const item = queue.get(pickKey), scale = rate.slowUntil > now ? 2 : 1;
           queue.delete(pickKey); rate.ts.push(now); rate.lastReqAt = Math.max(rate.lastReqAt, now);
-          const u = rate.ts.length, bgGap = (u < 12 ? 9500 : u < 20 ? 14000 : 20000) * scale + Math.floor(Math.random() * 500);
-          rate.nextBgAt = Math.max(rate.nextBgAt, now + (item.priority ? CFG.hoverGapMs * scale : bgGap));
+          const u = rate.ts.length, bgGap = (u < 12 ? 9000 : u < 20 ? 14000 : 20000) * scale + Math.floor(Math.random() * 400);
+          rate.nextBgAt = Math.max(rate.nextBgAt, now + (item.priority || item.step2 ? CFG.hoverGapMs * scale : bgGap));
           return { key: pickKey, item };
         });
       } catch { activeKey = ''; return; }
@@ -239,8 +240,8 @@
           if (await fetchListingHasPosts(item.author, 'top')) { setStatus(key, true, true); return; }
           if (partialHotTrue.has(key)) { setStatus(key, true, false); return; }
           partialTopFalse.add(key); syncDom(key);
-          // Background Step-2 inherits item.priority so it never steals hover-only reserve.
-          queue.set(key, { author: item.author, priority: item.priority, seq: ++seq });
+          // Step-2 for same author runs chained with short gap and cannot be pruned on scroll.
+          queue.set(key, { author: item.author, priority: item.priority, step2: true, seq: ++seq });
         } else setStatus(key, Boolean(await fetchListingHasPosts(item.author, 'hot')), false);
       } catch (err) {
         if (err.status === 404 || err.status === 403) setStatus(key, false, false);
@@ -371,12 +372,15 @@
   function seedEmptyProfileIfReady() {
     const ctx = getProfileCtx();
     if (!ctx || authorCache.get(ctx.owner)?.expiresAt > Date.now()) return;
-    if ([...document.querySelectorAll(POST_SEL)].some((p) => !p.matches(AD_SEL) && !p.hasAttribute('is-promoted') && !p.parentElement?.closest(POST_SEL) && normAuthor(p.getAttribute(p.matches('shreddit-post') ? 'author' : 'data-author') || '').toLowerCase() === ctx.owner)) return;
+    if ([...document.querySelectorAll(POST_SEL)].some((p) => !p.matches(AD_SEL) && !p.hasAttribute('is-promoted') && !p.parentElement?.closest(POST_SEL) && !p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') && normAuthor(p.getAttribute(p.matches('shreddit-post') ? 'author' : 'data-author') || '').toLowerCase() === ctx.owner)) return;
     const emptyEl = document.querySelector('p#noresults.error, [data-testid="empty-state"], shreddit-empty-state, faceplate-partial[name*="empty"]');
     const textEmpty = /hasn't posted yet|no posts yet|doesn't seem to be anything here|keeps their posts hidden|hidden their posts/.test((document.querySelector('main, [role="main"]')?.textContent || '').toLowerCase());
     if (!emptyEl && !textEmpty) return;
     if (ctx.sort === 'hot') setStatus(ctx.owner, false, false);
-    else if (ctx.sort === 'top' && (!ctx.t || ctx.t === 'all')) { partialTopFalse.add(ctx.owner); syncDom(ctx.owner); }
+    else if (ctx.sort === 'top' && (!ctx.t || ctx.t === 'all')) {
+      const cur = authorCache.get(ctx.owner);
+      setStatus(ctx.owner, cur?.hasHot ?? null, false);
+    }
   }
   function createWrap(author, authorId, noAuto) {
     const enc = encodeURIComponent(author), wrap = document.createElement('span');
@@ -430,7 +434,8 @@
       clearTimers(existing); observer.unobserve(post); postToWrap.delete(post); existing.remove();
     }
     if (!author || SKIP_AUTHORS.has(key) || !bar) return;
-    if (isOwnerSubmitted) {
+    const isRemoved = Boolean(post.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') || post.matches(AD_SEL) || post.hasAttribute('is-promoted'));
+    if (isOwnerSubmitted && !isRemoved) {
       if (prof.sort === 'top') setStatus(key, true, true);
       else if (prof.sort === 'hot') { const cur = authorCache.get(key); if (cur?.expiresAt > Date.now()) setStatus(key, true, cur.hasTop); else partialHotTrue.add(key); }
     }
