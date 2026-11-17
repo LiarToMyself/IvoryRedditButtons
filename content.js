@@ -32,7 +32,7 @@
   const readLs = (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } };
   const writeLs = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
   const storeGet = async (k) => { if (extStore) { try { const r = await extStore.get(k); return r && k in r ? r[k] : null; } catch {} } return readLs(k); };
-  const storeSet = async (k, v) => { if (extStore) { try { await extStore.set({ [k]: v }); return; } catch {} } writeLs(k, v); };
+  const storeSet = async (k, v) => { writeLs(k, v); if (extStore) { try { await extStore.set({ [k]: v }); return; } catch {} } };
   const withLock = (name, fn) => {
     if (typeof navigator !== 'undefined' && navigator.locks?.request) return navigator.locks.request(name, fn);
     const p = localLock.then(fn, fn); localLock = p.catch(() => {}); return p;
@@ -150,10 +150,10 @@
   const parseJsonListing = (d) => { if (d?.kind !== 'Listing' || !Array.isArray(d?.data?.children)) throw new Error('Invalid listing'); return d.data.children.some(isVisibleSubmissionItem); };
   const MISSING_USER_RE = /Sorry,\s+nobody on Reddit goes by that name\.|This account has been suspended/i;
   function hasVisiblePartialPost(html) {
-    if (typeof DOMParser === 'undefined') return /<shreddit-post\b/i.test(html) && !/slot\s*=\s*["']post-removed-banner["']/i.test(html);
+    if (typeof DOMParser === 'undefined') return /<shreddit-post\b/i.test(html) && !/slot\s*=\s*["'](?:post-removed-banner|mod-status)["']/i.test(html);
     return [...new DOMParser().parseFromString(html, 'text/html').querySelectorAll('shreddit-post')].some((p) => {
       const a = (p.getAttribute('author') || '').trim().toLowerCase();
-      return !p.parentElement?.closest('shreddit-post') && !p.hasAttribute('is-promoted') && !p.querySelector('[slot="post-removed-banner"]')
+      return !p.parentElement?.closest('shreddit-post') && !p.hasAttribute('is-promoted') && !p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]')
         && !p.getAttribute('removed-by-category') && p.getAttribute('is-removed') !== 'true' && a !== '[deleted]' && a !== '[removed]';
     });
   }
@@ -184,9 +184,18 @@
     rate.ts = pruneTs(rate.ts, now);
     const slow = rate.slowUntil > now, scale = slow ? 2 : 1;
     const isPri = Boolean(item?.priority), isStep2 = Boolean(item?.step2);
-    let until = Math.max(rate.limitedUntil, isPri ? (rate.lastReqAt ? rate.lastReqAt + CFG.hoverGapMs * scale : 0) : isStep2 ? Math.max(rate.pausedUntil, rate.lastReqAt + CFG.hoverGapMs * scale) : Math.max(rate.pausedUntil, tabReadyAt, rate.nextBgAt));
-    const maxMin = isPri ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
-    const max10m = isPri ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
+    let until = Math.max(
+      rate.limitedUntil,
+      (isPri && isStep2)
+        ? (rate.lastReqAt ? rate.lastReqAt + 200 * scale : 0)
+        : isPri
+        ? (rate.lastReqAt ? rate.lastReqAt + CFG.hoverGapMs * scale : 0)
+        : isStep2
+        ? Math.max(rate.pausedUntil, rate.lastReqAt + CFG.hoverGapMs * scale)
+        : Math.max(rate.pausedUntil, tabReadyAt, rate.nextBgAt)
+    );
+    const maxMin = (isPri || isStep2) ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
+    const max10m = (isPri || isStep2) ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
     const inMin = rate.ts.filter((t) => t > now - 60000);
     if (inMin.length >= maxMin) until = Math.max(until, inMin[inMin.length - maxMin] + 60050);
     if (rate.ts.length >= max10m) until = Math.max(until, rate.ts[rate.ts.length - max10m] + 600050);
@@ -202,6 +211,7 @@
     if (blocked.has(key)) return;
     if (authorCache.get(key)?.expiresAt > now) { syncDom(key); return; }
     if (!priority && (retryAfter.get(key) || 0) > now) return;
+    if (priority) retryAfter.delete(key);
     queue.set(key, { author, priority: Boolean(priority || queue.get(key)?.priority), seq: ++seq });
     pumpQueue();
   }
@@ -228,7 +238,7 @@
           if (!pickKey) return { dirty: false, wait: minWait };
           const item = queue.get(pickKey), scale = rate.slowUntil > now ? 2 : 1;
           queue.delete(pickKey); rate.ts.push(now); rate.lastReqAt = Math.max(rate.lastReqAt, now);
-          const u = rate.ts.length, bgGap = (u < 12 ? 9000 : u < 20 ? 14000 : 20000) * scale + Math.floor(Math.random() * 400);
+          const u = rate.ts.length, bgGap = (u <= 1 ? 4500 : u < 12 ? 9000 : u < 20 ? 14000 : 20000) * scale + Math.floor(Math.random() * 400);
           rate.nextBgAt = Math.max(rate.nextBgAt, now + (item.priority || item.step2 ? CFG.hoverGapMs * scale : bgGap));
           return { key: pickKey, item };
         });
@@ -364,22 +374,25 @@
   }, { rootMargin: '0px', threshold: 0.15 });
 
   function getProfileCtx() {
-    const m = location.pathname.match(/^\/(?:user|u)\/([^/?#]+)\/submitted\/?$/i);
+    const m = location.pathname.match(/^\/(?:user|u)\/([^/?#]+)(?:\/(submitted|posts|overview))?\/?$/i);
     if (!m) return null;
     const p = new URLSearchParams(location.search);
-    return { owner: safeDecode(m[1]).toLowerCase(), sort: (p.get('sort') || 'hot').toLowerCase(), t: (p.get('t') || '').toLowerCase() };
+    return { owner: safeDecode(m[1]).toLowerCase(), tab: (m[2] || 'overview').toLowerCase(), sort: (p.get('sort') || 'hot').toLowerCase(), t: (p.get('t') || '').toLowerCase() };
   }
   function seedEmptyProfileIfReady() {
     const ctx = getProfileCtx();
-    if (!ctx || authorCache.get(ctx.owner)?.expiresAt > Date.now()) return;
+    if (!ctx) return;
+    const cur = authorCache.get(ctx.owner);
+    if (cur?.expiresAt > Date.now() && (ctx.sort === 'top' ? cur.hasTop === false : cur.hasHot === false)) return;
     if ([...document.querySelectorAll(POST_SEL)].some((p) => !p.matches(AD_SEL) && !p.hasAttribute('is-promoted') && !p.parentElement?.closest(POST_SEL) && !p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') && normAuthor(p.getAttribute(p.matches('shreddit-post') ? 'author' : 'data-author') || '').toLowerCase() === ctx.owner)) return;
     const emptyEl = document.querySelector('p#noresults.error, [data-testid="empty-state"], shreddit-empty-state, faceplate-partial[name*="empty"]');
     const textEmpty = /hasn't posted yet|no posts yet|doesn't seem to be anything here|keeps their posts hidden|hidden their posts/.test((document.querySelector('main, [role="main"]')?.textContent || '').toLowerCase());
     if (!emptyEl && !textEmpty) return;
-    if (ctx.sort === 'hot') setStatus(ctx.owner, false, false);
-    else if (ctx.sort === 'top' && (!ctx.t || ctx.t === 'all')) {
-      const cur = authorCache.get(ctx.owner);
-      setStatus(ctx.owner, cur?.hasHot ?? null, false);
+    if (ctx.sort === 'top') {
+      if (typeof cur?.hasHot === 'boolean') setStatus(ctx.owner, cur.hasHot, false);
+      else { partialTopFalse.add(ctx.owner); syncDom(ctx.owner); }
+    } else if (ctx.sort === 'hot' || textEmpty) {
+      setStatus(ctx.owner, false, false);
     }
   }
   function createWrap(author, authorId, noAuto) {
@@ -422,7 +435,9 @@
     const rawAuth = post.getAttribute(modern ? 'author' : 'data-author') || [...(bar || post).querySelectorAll('a[href*="/user/"],a[href*="/u/"]')].find((a) => !a.closest(`.${WRAP}`) && a.closest(POST_SEL) === post)?.getAttribute('href')?.match(/\/(?:user|u)\/([^/?#]+)/i)?.[1] || '';
     const author = normAuthor(rawAuth), key = author.toLowerCase(), directId = post.getAttribute(modern ? 'author-id' : 'data-author-fullname') || '';
     const authorId = /^t2_[a-z0-9]+$/i.test(directId) ? directId : [...post.querySelectorAll('[author-id],[data-author-fullname]')].map((el) => (el.closest(POST_SEL) === post ? el.getAttribute('author-id') || el.getAttribute('data-author-fullname') : '')).find((v) => /^t2_[a-z0-9]+$/i.test(v || '')) || '';
-    const prof = !isNested ? getProfileCtx() : null, isOwnerSubmitted = Boolean(prof && prof.owner === key), noAuto = isNested || isOwnerSubmitted;
+    const pageOwnerMatch = location.pathname.match(/^\/(?:user|u)\/([^/?#]+)/i);
+    const pageOwner = pageOwnerMatch ? safeDecode(pageOwnerMatch[1]).toLowerCase() : '';
+    const prof = !isNested ? getProfileCtx() : null, isOwnerSubmitted = Boolean(prof && prof.owner === key), noAuto = isNested || (pageOwner ? pageOwner === key : isOwnerSubmitted);
     const existing = findOwnWrap(post);
     if (existing) {
       if (existing.dataset.author === author) {
@@ -474,16 +489,22 @@
     (n.matches(`.${WRAP}`) ? [n] : [...n.querySelectorAll(`.${WRAP}`)]).forEach((w) => { clearTimers(w); w.dataset.nearby = 'false'; });
     (n.matches(POST_SEL) ? [n, ...n.querySelectorAll(POST_SEL)] : [...n.querySelectorAll(POST_SEL)]).forEach((p) => { observer.unobserve(p); postToWrap.delete(p); });
   };
+  let lastUrl = location.href;
+  const onNav = () => { if (location.href !== lastUrl) { lastUrl = location.href; setTimeout(() => ready.then(seedEmptyProfileIfReady), CFG.settleMs); } };
+  window.addEventListener('popstate', onNav);
   document.querySelectorAll(POST_SEL).forEach(processPost);
   setTimeout(() => ready.then(seedEmptyProfileIfReady), CFG.settleMs);
   if (document.body) {
     new MutationObserver((muts) => {
+      onNav();
       for (const m of muts) {
         if (m.target.nodeType === 1 && m.target.closest(`.${WRAP}`)) continue;
         if (m.type === 'attributes') { collect(m.target); continue; }
         if (m.target.nodeType === 1) { const p = m.target.closest(POST_SEL); if (p) pending.add(p); }
         m.removedNodes?.forEach(cleanupRemoved); m.addedNodes?.forEach(collect);
       }
+      const hasEmpty = muts.some((m) => [...(m.addedNodes || [])].some((n) => n.nodeType === 1 && (n.matches?.('shreddit-empty-state, [data-testid="empty-state"]') || n.querySelector?.('shreddit-empty-state, [data-testid="empty-state"]'))));
+      if (hasEmpty) setTimeout(() => ready.then(seedEmptyProfileIfReady), 100);
       if (raf || !pending.size) return;
       raf = true;
       requestAnimationFrame(() => { raf = false; const list = [...pending]; pending.clear(); list.forEach(processPost); seedEmptyProfileIfReady(); });
