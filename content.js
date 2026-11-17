@@ -104,6 +104,7 @@
   }
   const set429 = (waitMs, now) => { rate.limitedUntil = Math.max(rate.limitedUntil, now + Math.max(waitMs, CFG.fallback429Ms)); rate.slowUntil = Math.max(rate.slowUntil, rate.limitedUntil + CFG.slowAfter429Ms); };
   const assertNotLimited = (now) => { if (rate.limitedUntil > now) { const e = new Error(`Rate limit active (${Math.ceil((rate.limitedUntil - now) / 1000)}s)`); e.status = 429; throw e; } };
+  const MISSING_USER_RE = /Sorry,\s+nobody on Reddit goes by that name\.|This account has been suspended/i;
 
   async function fetchRaw(url, opts = {}, accept = 'application/json', countDirect = false) {
     await ready;
@@ -125,10 +126,7 @@
           if (lowQuota) rate.pausedUntil = Math.max(rate.pausedUntil, now + (Number.isFinite(reset) && reset > 0 ? Math.min(reset, 120) : 60) * 1000);
         });
       }
-      if (!res.ok) {
-        if (MISSING_USER_RE.test(text)) { const e = new Error('Missing user'); e.status = 404; e.settledEmpty = true; throw e; }
-        const e = new Error(`Reddit HTTP ${res.status}`); e.status = res.status; throw e;
-      }
+      if (!res.ok) { if (MISSING_USER_RE.test(text)) { const e = new Error('Missing user'); e.status = 404; e.settledEmpty = true; throw e; } const e = new Error(`Reddit HTTP ${res.status}`); e.status = res.status; throw e; }
       if (res.redirected) {
         const o = new URL(url, location.origin), d = new URL(res.url, location.origin);
         if (o.origin !== d.origin || !/^\/(?:(?:user|u)\/[^/]+\/(?:submitted|about)\.json|api\/me\.json|svc\/shreddit\/profiles\/profile_posts-more-posts\/(?:top|hot)\/?)$/i.test(d.pathname)) throw new Error('Unexpected redirect');
@@ -151,7 +149,6 @@
 
   const isVisibleSubmissionItem = (c) => Boolean(c?.data && (!c.kind || c.kind === 't3') && !c.data.removed_by_category && c.data.removed !== true && c.data.spam !== true && c.data.hidden !== true && c.data.author !== '[deleted]');
   const parseJsonListing = (d) => { if (d?.kind !== 'Listing' || !Array.isArray(d?.data?.children)) throw new Error('Invalid listing'); return d.data.children.some(isVisibleSubmissionItem); };
-  const MISSING_USER_RE = /Sorry,\s+nobody on Reddit goes by that name\.|This account has been suspended/i;
   function hasVisiblePartialPost(html) {
     if (typeof DOMParser === 'undefined') return /<shreddit-post\b/i.test(html) && !/slot\s*=\s*["'](?:post-removed-banner|mod-status)["']/i.test(html);
     return [...new DOMParser().parseFromString(html, 'text/html').querySelectorAll('shreddit-post')].some((p) => {
