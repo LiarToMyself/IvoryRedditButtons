@@ -1,98 +1,75 @@
 const WRAP_CLASS = 'author-btns-wrap';
 const POST_SELECTOR = 'shreddit-post, .thing.link';
 const BLOCKED_STORAGE_KEY = 'ivory_reddit_blocked_v1';
-const STATUS_STORAGE_KEY = 'ivory_reddit_author_status_v1';
-const RATELIMIT_STORAGE_KEY = 'ivory_reddit_ratelimit_v1';
+const STATUS_STORAGE_KEY = 'ivory_reddit_author_status_v4';
+const RATELIMIT_STORAGE_KEY = 'ivory_reddit_ratelimit_v4';
+const LEGACY_STORAGE_KEYS = [
+  'ivory_reddit_author_status_v1',
+  'ivory_reddit_author_status_v2',
+  'ivory_reddit_author_status_v3',
+  'ivory_reddit_ratelimit_v1',
+  'ivory_reddit_ratelimit_v2',
+  'ivory_reddit_ratelimit_v3',
+  'ivory_reddit_last_req_v1',
+];
 
 const BASE_BTN_STYLE =
   'position:relative;z-index:10;pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;height:26px;min-height:26px;max-height:26px;min-width:0;appearance:none;vertical-align:middle;gap:5px;margin:0;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:16px;text-decoration:none;white-space:nowrap;cursor:pointer;user-select:none;font-family:inherit;flex-shrink:0;transition:background 0.15s,border-color 0.15s,color 0.15s,opacity 0.15s;';
-
-const NORMAL_THEME = {
-  bg: '#272729',
-  bgHover: '#343536',
-  color: '#d7dadc',
-  border: '#343536',
-};
-
-const EMPTY_THEME = {
-  bg: '#3b1d20',
-  bgHover: '#4f262a',
-  color: '#f5b7b1',
-  border: '#6e2c33',
-};
-
-const BLOCK_THEME = {
-  bg: '#33241b',
-  bgHover: '#473022',
-  color: '#f5cba7',
-  border: '#5c3d2e',
-};
-
-const BLOCKED_THEME = {
-  bg: '#1b2e22',
-  bgHover: '#1b2e22',
-  color: '#82e0aa',
-  border: '#2e523b',
-};
-
+const NORMAL_THEME = { bg: '#272729', bgHover: '#343536', color: '#d7dadc', border: '#343536' };
+const EMPTY_THEME = { bg: '#3b1d20', bgHover: '#4f262a', color: '#f5b7b1', border: '#6e2c33' };
+const BLOCK_THEME = { bg: '#33241b', bgHover: '#473022', color: '#f5cba7', border: '#5c3d2e' };
+const BLOCKED_THEME = { bg: '#1b2e22', bgHover: '#1b2e22', color: '#82e0aa', border: '#2e523b' };
 const BADGE_STYLE =
   'display:inline-block;padding:1px 5px;background:#6e2c33;color:#ffd7d5;border-radius:999px;font-size:10px;font-weight:700;line-height:13px;';
 
-const MAX_CONCURRENT = 1;
 const REQUEST_TIMEOUT_MS = 15000;
-const REQUEST_INTERVAL_MS = 2200;
-const PRIORITY_INTERVAL_MS = 1200;
+const REQUEST_INTERVAL_MS = 2400;
 const VIEWPORT_DWELL_MS = 900;
-const STATUS_TTL_MS = 60 * 60 * 1000;
+const HOVER_DEBOUNCE_MS = 180;
+const PREFETCH_MARGIN_PX = 200;
+const STATUS_TTL_MS = 2 * 60 * 60 * 1000;
 const FAILURE_TTL_MS = 60 * 1000;
-const RATE_LIMIT_BASE_BACKOFF_MS = 5 * 60 * 1000;
-const RATE_LIMIT_MAX_BACKOFF_MS = 15 * 60 * 1000;
+const RATE_LIMIT_FALLBACK_MS = 10 * 60 * 1000;
 const MAX_CACHE_SIZE = 1000;
-const PREFETCH_MARGIN_PX = 40;
 const BLOCK_COOLDOWN_MS = 1500;
 const ERROR_LOCK_MS = 2000;
-const BG_RATELIMIT_RESERVE = 25;
-const MIN_RATELIMIT_RESERVE = 5;
-const BG_WINDOW_SHORT_MS = 60 * 1000;
-const BG_MAX_PER_MIN = 10;
-const BG_WINDOW_LONG_MS = 10 * 60 * 1000;
-const BG_MAX_PER_10MIN = 45;
-const PERSIST_DEBOUNCE_MS = 500;
+const RATELIMIT_RESERVE = 20;
+const WINDOW_SHORT_MS = 60 * 1000;
+const MAX_PER_MIN = 7;
+const WINDOW_LONG_MS = 10 * 60 * 1000;
+const MAX_PER_10MIN = 28;
 
 const authorCache = new Map();
-const blockedAuthors = loadBlockedAuthors();
+const inFlightChecks = new Map();
+const retryAfterMap = new Map();
+const blockedAuthors = new Set();
 const pendingBlocks = new Set();
 const authorErrors = new Map();
-const detachedWraps = new WeakSet();
 const dwellTimers = new WeakMap();
+const hoverTimers = new WeakMap();
+const postToWrapMap = new WeakMap();
+const dimmedPosts = new WeakMap();
 const fetchQueue = [];
 
 let activeRequests = 0;
 let nextRequestAt = 0;
 let rateLimitedUntil = 0;
-let bgPausedUntil = 0;
-let hoverPausedUntil = 0;
-let consecutive429s = 0;
-let recentBgTimestamps = [];
-let lastRateStateUpdatedAt = 0;
-let lastRateLimitRemaining = null;
+let quotaPausedUntil = 0;
+let recentTimestamps = [];
 let nextBlockAllowedAt = 0;
 let queueTimer = null;
-let persistTimer = null;
 let cachedModhash = '';
 let modhashPromise = null;
 let blockChain = Promise.resolve();
+let seqCounter = 0;
 
-hydrateRateLimitFromStorage();
-hydrateAuthorCacheFromSession();
+initStorage();
 
-function readStorageItem(key) {
+function readStorage(key) {
   try {
-    const localVal = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
-    if (localVal) return localVal;
-  } catch {
-    // Ignore localStorage access errors.
-  }
+    const val = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
+    if (val) return val;
+  } catch {}
   try {
     return typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(key) : null;
   } catch {
@@ -100,205 +77,105 @@ function readStorageItem(key) {
   }
 }
 
-function writeStorageItem(key, value) {
+function writeStorage(key, val) {
   try {
-    if (typeof localStorage !== 'undefined') localStorage.setItem(key, value);
-  } catch {
-    // Ignore localStorage quota or privacy errors.
-  }
+    if (typeof localStorage !== 'undefined') localStorage.setItem(key, val);
+  } catch {}
   try {
-    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(key, value);
-  } catch {
-    // Ignore sessionStorage quota or privacy errors.
-  }
-}
-
-function loadBlockedAuthors() {
-  try {
-    const raw = readStorageItem(BLOCKED_STORAGE_KEY);
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? new Set(parsed.map((a) => String(a).toLowerCase())) : new Set();
-  } catch {
-    return new Set();
-  }
+    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(key, val);
+  } catch {}
 }
 
 function saveBlockedAuthors() {
-  writeStorageItem(BLOCKED_STORAGE_KEY, JSON.stringify([...blockedAuthors]));
+  writeStorage(BLOCKED_STORAGE_KEY, JSON.stringify([...blockedAuthors]));
 }
 
-function pruneRecentTimestamps(list, now = Date.now()) {
+function initStorage() {
+  for (const key of LEGACY_STORAGE_KEYS) {
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(key);
+      if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(key);
+    } catch {}
+  }
+  try {
+    const rawBlocked = readStorage(BLOCKED_STORAGE_KEY);
+    if (rawBlocked) {
+      JSON.parse(rawBlocked).forEach((a) => blockedAuthors.add(String(a).toLowerCase()));
+    }
+  } catch {}
+  hydrateRateLimit();
+  hydrateAuthorCache();
+}
+
+function pruneTimestamps(list, now = Date.now()) {
   if (!Array.isArray(list)) return [];
   return list
-    .filter((ts) => typeof ts === 'number' && Number.isFinite(ts) && ts > now - BG_WINDOW_LONG_MS)
+    .filter((t) => typeof t === 'number' && Number.isFinite(t) && t > now - WINDOW_LONG_MS)
     .sort((a, b) => a - b)
-    .slice(-(BG_MAX_PER_10MIN + 20));
+    .slice(-MAX_PER_10MIN);
 }
 
-function hydrateRateLimitFromStorage() {
+function hydrateRateLimit() {
   try {
-    const raw = readStorageItem(RATELIMIT_STORAGE_KEY);
+    const raw = readStorage(RATELIMIT_STORAGE_KEY);
     if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return;
+    const data = JSON.parse(raw);
     const now = Date.now();
-    if (typeof parsed.rateLimitedUntil === 'number' && parsed.rateLimitedUntil > now) {
-      rateLimitedUntil = Math.max(rateLimitedUntil, parsed.rateLimitedUntil);
+    if (typeof data.rateLimitedUntil === 'number' && data.rateLimitedUntil > now) {
+      rateLimitedUntil = Math.max(rateLimitedUntil, data.rateLimitedUntil);
     }
-    if (typeof parsed.bgPausedUntil === 'number' && parsed.bgPausedUntil > now) {
-      bgPausedUntil = Math.max(bgPausedUntil, parsed.bgPausedUntil);
+    if (typeof data.nextRequestAt === 'number' && data.nextRequestAt > now) {
+      nextRequestAt = Math.max(nextRequestAt, data.nextRequestAt);
     }
-    if (typeof parsed.hoverPausedUntil === 'number' && parsed.hoverPausedUntil > now) {
-      hoverPausedUntil = Math.max(hoverPausedUntil, parsed.hoverPausedUntil);
+    if (Array.isArray(data.recentTimestamps)) {
+      const merged = [...new Set([...recentTimestamps, ...data.recentTimestamps])];
+      recentTimestamps = pruneTimestamps(merged, now);
     }
-    if (typeof parsed.nextRequestAt === 'number' && parsed.nextRequestAt > now) {
-      nextRequestAt = Math.max(nextRequestAt, parsed.nextRequestAt);
-    }
-    if (typeof parsed.updatedAt === 'number' && parsed.updatedAt >= lastRateStateUpdatedAt) {
-      lastRateStateUpdatedAt = parsed.updatedAt;
-      if (typeof parsed.consecutive429s === 'number' && parsed.consecutive429s >= 0) {
-        consecutive429s = parsed.consecutive429s;
-      }
-      if (Array.isArray(parsed.recentBgTimestamps)) {
-        recentBgTimestamps = pruneRecentTimestamps(parsed.recentBgTimestamps, now);
-      }
-    }
-  } catch {
-    // Ignore malformed rate-limit state.
-  }
+  } catch {}
 }
 
-function persistRateLimitToStorage() {
+function persistRateLimit() {
   const now = Date.now();
-  lastRateStateUpdatedAt = now;
-  recentBgTimestamps = pruneRecentTimestamps(recentBgTimestamps, now);
-  writeStorageItem(
+  recentTimestamps = pruneTimestamps(recentTimestamps, now);
+  writeStorage(
     RATELIMIT_STORAGE_KEY,
-    JSON.stringify({
-      rateLimitedUntil,
-      bgPausedUntil,
-      hoverPausedUntil,
-      nextRequestAt,
-      consecutive429s,
-      recentBgTimestamps,
-      updatedAt: now,
-    })
+    JSON.stringify({ rateLimitedUntil, nextRequestAt, recentTimestamps })
   );
 }
 
-function applyHydratedAuthorRecord(key, val, now) {
-  if (!val || typeof val.expiresAt !== 'number' || val.expiresAt <= now) return;
-  if (typeof val.hasHot === 'boolean' && typeof val.hasTop === 'boolean') {
-    const status = {
-      hasHot: val.hasHot,
-      hotError: '',
-      hasTop: val.hasTop,
-      topError: '',
-      retryable: false,
-      retryAt: val.expiresAt,
-    };
-    const hotObj = { hasHot: val.hasHot, hotError: '', retryable: false };
-    authorCache.set(key, {
-      expiresAt: val.expiresAt,
-      retryAfterAt: 0,
-      hotResult: hotObj,
-      hotPromise: Promise.resolve(hotObj),
-      promise: Promise.resolve(status),
-      consumers: new Set(),
-      unscoped: false,
-      priority: false,
-      settledStatus: status,
-    });
-  } else if (typeof val.hasHot === 'boolean') {
-    const hotObj = { hasHot: val.hasHot, hotError: '', retryable: false };
-    const existing = authorCache.get(key);
-    if (!existing || !existing.settledStatus) {
-      authorCache.set(key, {
-        expiresAt: val.expiresAt,
-        retryAfterAt: 0,
-        hotResult: hotObj,
-        hotPromise: Promise.resolve(hotObj),
-        promise: null,
-        consumers: new Set(),
-        unscoped: false,
-        priority: false,
-        settledStatus: null,
-      });
-    }
-  }
-}
-
-function hydrateAuthorCacheFromSession() {
-  for (const source of [
-    () => (typeof localStorage !== 'undefined' ? localStorage.getItem(STATUS_STORAGE_KEY) : null),
-    () =>
-      typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(STATUS_STORAGE_KEY) : null,
-  ]) {
-    try {
-      const raw = source();
-      if (!raw) continue;
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') continue;
-      const now = Date.now();
-      for (const [key, val] of Object.entries(parsed)) {
-        applyHydratedAuthorRecord(key.toLowerCase(), val, now);
-      }
-    } catch {
-      // Ignore malformed cache source.
-    }
-  }
-}
-
-function persistAuthorCacheToSession() {
-  if (persistTimer !== null) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
-  }
+function hydrateAuthorCache() {
   try {
+    const raw = readStorage(STATUS_STORAGE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
     const now = Date.now();
-    const serializable = {};
-    for (const [key, entry] of authorCache.entries()) {
-      if (entry.expiresAt !== Infinity && entry.expiresAt <= now) {
-        authorCache.delete(key);
+    for (const [k, v] of Object.entries(data)) {
+      if (v && v.expiresAt > now && typeof v.hasHot === 'boolean' && typeof v.hasTop === 'boolean') {
+        authorCache.set(k.toLowerCase(), {
+          hasHot: v.hasHot,
+          hasTop: v.hasTop,
+          expiresAt: v.expiresAt,
+        });
+      }
+    }
+  } catch {}
+}
+
+function persistAuthorCache() {
+  const now = Date.now();
+  const out = {};
+  for (const [k, v] of authorCache.entries()) {
+    if (v.expiresAt <= now) {
+      authorCache.delete(k);
+    } else if (typeof v.hasHot === 'boolean' && typeof v.hasTop === 'boolean') {
+      if (authorCache.size > MAX_CACHE_SIZE) {
+        authorCache.delete(k);
         continue;
       }
-      if (
-        entry.expiresAt !== Infinity &&
-        entry.expiresAt > now &&
-        entry.settledStatus &&
-        typeof entry.settledStatus.hasHot === 'boolean' &&
-        typeof entry.settledStatus.hasTop === 'boolean'
-      ) {
-        serializable[key] = {
-          hasHot: entry.settledStatus.hasHot,
-          hasTop: entry.settledStatus.hasTop,
-          expiresAt: entry.expiresAt,
-        };
-      } else if (
-        entry.expiresAt !== Infinity &&
-        entry.expiresAt > now &&
-        entry.hotResult &&
-        typeof entry.hotResult.hasHot === 'boolean'
-      ) {
-        serializable[key] = {
-          hasHot: entry.hotResult.hasHot,
-          expiresAt: entry.expiresAt,
-        };
-      }
+      out[k] = { hasHot: v.hasHot, hasTop: v.hasTop, expiresAt: v.expiresAt };
     }
-    writeStorageItem(STATUS_STORAGE_KEY, JSON.stringify(serializable));
-  } catch {
-    // Ignore storage quota errors.
   }
-}
-
-function schedulePersistAuthorCache() {
-  if (persistTimer !== null) return;
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    persistAuthorCacheToSession();
-  }, PERSIST_DEBOUNCE_MS);
+  writeStorage(STATUS_STORAGE_KEY, JSON.stringify(out));
 }
 
 class RequestError extends Error {
@@ -310,103 +187,164 @@ class RequestError extends Error {
   }
 }
 
-class CancelledCheck extends Error {}
-
 function parseHeaderNumber(raw, mode = 'min') {
   if (raw === null || raw === undefined) return NaN;
-  const parts = String(raw)
+  const nums = String(raw)
     .split(',')
-    .map((p) => Number(p.trim()))
+    .map((s) => parseFloat(s.trim()))
     .filter((n) => Number.isFinite(n));
-  if (!parts.length) return NaN;
-  return mode === 'max' ? Math.max(...parts) : Math.min(...parts);
+  if (!nums.length) return NaN;
+  return mode === 'max' ? Math.max(...nums) : Math.min(...nums);
 }
 
-function extractWaitMsFromBody(bodyText) {
-  if (!bodyText) return 0;
+function getBudgetBlockedUntil(now = Date.now()) {
+  recentTimestamps = pruneTimestamps(recentTimestamps, now);
+  let blockedUntil = Math.max(nextRequestAt, rateLimitedUntil, quotaPausedUntil);
+  const shortCut = now - WINDOW_SHORT_MS;
+  const inShort = recentTimestamps.filter((t) => t > shortCut);
+  if (inShort.length >= MAX_PER_MIN) {
+    blockedUntil = Math.max(
+      blockedUntil,
+      inShort[inShort.length - MAX_PER_MIN] + WINDOW_SHORT_MS + 50
+    );
+  }
+  if (recentTimestamps.length >= MAX_PER_10MIN) {
+    blockedUntil = Math.max(
+      blockedUntil,
+      recentTimestamps[recentTimestamps.length - MAX_PER_10MIN] + WINDOW_LONG_MS + 50
+    );
+  }
+  return blockedUntil;
+}
+
+function respectRateLimit(res, bodyText = '') {
+  const now = Date.now();
+  if (res.status === 429) {
+    const headerSec = parseHeaderNumber(res.headers.get('Retry-After'), 'max');
+    const secMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*seconds?/i);
+    const minMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*minutes?/i);
+    const bodyMs = secMatch
+      ? Number(secMatch[1]) * 1000
+      : minMatch
+        ? Number(minMatch[1]) * 60000
+        : 0;
+    const waitMs =
+      Number.isFinite(headerSec) && headerSec > 0
+        ? headerSec * 1000
+        : bodyMs > 0
+          ? bodyMs
+          : RATE_LIMIT_FALLBACK_MS;
+    rateLimitedUntil = Math.max(rateLimitedUntil, now + waitMs);
+  }
+  const rem = parseHeaderNumber(res.headers.get('X-Ratelimit-Remaining'), 'min');
+  const reset = parseHeaderNumber(res.headers.get('X-Ratelimit-Reset'), 'max');
+  if (Number.isFinite(rem) && rem <= RATELIMIT_RESERVE) {
+    const pauseMs = Number.isFinite(reset) && reset > 0 ? Math.min(reset, 60) * 1000 : 30000;
+    quotaPausedUntil = Math.max(quotaPausedUntil, now + pauseMs);
+  }
+  persistRateLimit();
+}
+
+function isAllowedListingRedirect(origUrl, finalUrl) {
   try {
-    const json = JSON.parse(bodyText);
-    const rateSec = Number(json?.json?.ratelimit ?? json?.ratelimit ?? json?.retry_after);
-    if (Number.isFinite(rateSec) && rateSec > 0) return Math.ceil(rateSec * 1000);
+    const o = new URL(origUrl, location.origin);
+    const d = new URL(finalUrl, location.origin);
+    return (
+      o.origin === d.origin &&
+      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(o.pathname) &&
+      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(d.pathname)
+    );
   } catch {
-    // Response is plain text or HTML; fall through to regex parsing.
+    return false;
   }
-  const secMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*seconds?/i);
-  if (secMatch) return Math.ceil(Number(secMatch[1]) * 1000);
-  const minMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*minutes?/i);
-  if (minMatch) return Math.ceil(Number(minMatch[1]) * 60 * 1000);
-  return 0;
 }
 
-function getAdaptiveIntervalMs(isPriorityOrContinuation) {
-  if (isPriorityOrContinuation) return PRIORITY_INTERVAL_MS;
-  if (lastRateLimitRemaining !== null && Number.isFinite(lastRateLimitRemaining)) {
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 10) return 3600;
-    if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 25) return 2800;
+async function fetchJsonDirect(url, options = {}) {
+  hydrateRateLimit();
+  if (rateLimitedUntil > Date.now()) {
+    const waitSec = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
+    throw new RequestError(`Reddit rate limit active (${waitSec}s).`, {
+      status: 429,
+      retryable: true,
+    });
   }
-  return REQUEST_INTERVAL_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      ...options,
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', ...options.headers },
+      signal: controller.signal,
+    });
+    const text = await res.text().catch(() => '');
+    respectRateLimit(res, res.status === 429 ? text : '');
+    if (!res.ok) {
+      throw new RequestError(`Reddit HTTP ${res.status}`, {
+        status: res.status,
+        retryable: res.status === 429 || res.status >= 500,
+        uncertain: res.status >= 500,
+      });
+    }
+    if (res.redirected && !isAllowedListingRedirect(url, res.url)) {
+      throw new RequestError('Unexpected redirect.', { retryable: true, uncertain: true });
+    }
+    if (options.method === 'POST' && (res.status === 204 || !text.trim())) return {};
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new RequestError('Unreadable response from Reddit.', { retryable: true, uncertain: true });
+    }
+    const errors = data?.json?.errors ?? data?.errors;
+    if (Array.isArray(errors) && errors.length) {
+      const limited = errors.some((e) => Array.isArray(e) && e[0] === 'RATELIMIT');
+      if (limited) {
+        rateLimitedUntil = Math.max(rateLimitedUntil, Date.now() + RATE_LIMIT_FALLBACK_MS);
+        persistRateLimit();
+      }
+      throw new RequestError(
+        errors.map((e) => (Array.isArray(e) ? e.slice(0, 2).join(': ') : String(e))).join('; '),
+        { status: limited ? 429 : 0, retryable: limited }
+      );
+    }
+    if (data?.error || data?.success === false) {
+      throw new RequestError(String(data.message || data.error || 'Request rejected.'));
+    }
+    return data;
+  } catch (err) {
+    if (err instanceof RequestError) throw err;
+    throw new RequestError(
+      controller.signal.aborted ? 'Request timed out.' : 'Network error.',
+      { retryable: true, uncertain: true }
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-function getBgBudgetResumeAt(now) {
-  recentBgTimestamps = pruneRecentTimestamps(recentBgTimestamps, now);
-  let resumeAt = 0;
-
-  const shortCutoff = now - BG_WINDOW_SHORT_MS;
-  const inShortWindow = recentBgTimestamps.filter((ts) => ts > shortCutoff);
-  if (inShortWindow.length >= BG_MAX_PER_MIN) {
-    const oldestShort = inShortWindow[inShortWindow.length - BG_MAX_PER_MIN];
-    resumeAt = Math.max(resumeAt, oldestShort + BG_WINDOW_SHORT_MS + 50);
-  }
-
-  if (recentBgTimestamps.length >= BG_MAX_PER_10MIN) {
-    const oldestLong = recentBgTimestamps[recentBgTimestamps.length - BG_MAX_PER_10MIN];
-    resumeAt = Math.max(resumeAt, oldestLong + BG_WINDOW_LONG_MS + 50);
-  }
-
-  return resumeAt;
-}
-
-function getEntryBlockedUntil(entry, now = Date.now()) {
-  if (entry.continuation || entry.priority) {
-    return Math.max(nextRequestAt, rateLimitedUntil, hoverPausedUntil);
-  }
-  return Math.max(nextRequestAt, rateLimitedUntil, bgPausedUntil, getBgBudgetResumeAt(now));
-}
-
-function enqueueRequest(task, priority = false, isRelevant = () => true, meta = {}) {
+function enqueueListingRequest(task, authorKey, priority = false) {
   return new Promise((resolve, reject) => {
-    const entry = {
+    fetchQueue.push({
       task,
       resolve,
       reject,
-      isRelevant,
+      authorKey,
       priority: Boolean(priority),
-      continuation: Boolean(meta.continuation),
-      authorKey: meta.authorKey ? String(meta.authorKey).toLowerCase() : '',
-    };
-    if (entry.continuation || entry.priority) {
-      fetchQueue.unshift(entry);
-    } else {
-      fetchQueue.push(entry);
-    }
+      seq: ++seqCounter,
+    });
     processQueue();
   });
 }
 
-function promoteAuthorInQueue(authorKey) {
-  const key = String(authorKey || '').toLowerCase();
-  if (!key) return false;
-  let promoted = false;
-  for (let i = fetchQueue.length - 1; i >= 0; i--) {
-    if (fetchQueue[i].authorKey === key) {
-      const [entry] = fetchQueue.splice(i, 1);
-      entry.priority = true;
-      fetchQueue.unshift(entry);
-      promoted = true;
+function isAuthorVisibleInDom(authorKey) {
+  const wraps = document.querySelectorAll(`.${WRAP_CLASS}`);
+  for (const w of wraps) {
+    if ((w.dataset.author || '').toLowerCase() === authorKey && w.dataset.nearby === 'true') {
+      return true;
     }
   }
-  if (promoted) processQueue();
-  return promoted;
+  return false;
 }
 
 function processQueue() {
@@ -414,43 +352,42 @@ function processQueue() {
     clearTimeout(queueTimer);
     queueTimer = null;
   }
-  for (let i = fetchQueue.length - 1; i >= 0; i--) {
-    if (!fetchQueue[i].isRelevant()) {
-      const [entry] = fetchQueue.splice(i, 1);
-      entry.reject(new CancelledCheck());
-    }
-  }
   if (document.visibilityState === 'hidden' || pendingBlocks.size > 0) return;
-  if (activeRequests >= MAX_CONCURRENT || fetchQueue.length === 0) return;
+  if (activeRequests >= 1 || fetchQueue.length === 0) return;
 
-  hydrateRateLimitFromStorage();
-
-  const now = Date.now();
-  let runnableIndex = -1;
-  let minDelay = Infinity;
-
-  for (let i = 0; i < fetchQueue.length; i++) {
-    const delay = getEntryBlockedUntil(fetchQueue[i], now) - now;
-    if (delay <= 0) {
-      runnableIndex = i;
-      break;
+  for (let i = fetchQueue.length - 1; i >= 0; i--) {
+    const item = fetchQueue[i];
+    if (blockedAuthors.has(item.authorKey) || (!item.priority && !isAuthorVisibleInDom(item.authorKey))) {
+      fetchQueue.splice(i, 1);
+      item.resolve(null);
     }
-    if (delay < minDelay) minDelay = delay;
   }
+  if (fetchQueue.length === 0) return;
 
-  if (runnableIndex === -1) {
-    if (Number.isFinite(minDelay) && minDelay > 0) {
-      queueTimer = setTimeout(processQueue, Math.min(minDelay, 2147483647));
-    }
+  hydrateRateLimit();
+  const now = Date.now();
+  const blockedUntil = getBudgetBlockedUntil(now);
+  if (blockedUntil > now) {
+    queueTimer = setTimeout(processQueue, Math.min(blockedUntil - now + 25, 60000));
     return;
   }
 
-  const [entry] = fetchQueue.splice(runnableIndex, 1);
+  let bestIdx = 0;
+  let bestScore = -Infinity;
+  for (let i = 0; i < fetchQueue.length; i++) {
+    const score = (fetchQueue[i].priority ? 1e9 : 0) + fetchQueue[i].seq;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+
+  const [entry] = fetchQueue.splice(bestIdx, 1);
   activeRequests++;
   const startedAt = Date.now();
-  recentBgTimestamps.push(startedAt);
-  nextRequestAt = startedAt + getAdaptiveIntervalMs(entry.priority || entry.continuation);
-  persistRateLimitToStorage();
+  recentTimestamps.push(startedAt);
+  nextRequestAt = startedAt + REQUEST_INTERVAL_MS;
+  persistRateLimit();
 
   Promise.resolve()
     .then(entry.task)
@@ -459,170 +396,25 @@ function processQueue() {
       activeRequests--;
       processQueue();
     });
-  processQueue();
 }
 
-function respectRateLimit(res, extraWaitMs = 0) {
-  const now = Date.now();
-  let changed = false;
-
-  if (res.status === 429) {
-    consecutive429s++;
-    const value = res.headers.get('Retry-After');
-    const seconds = value === null ? NaN : Number(value);
-    const headerRetryAt = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(value);
-    const expBackoff = Math.min(
-      RATE_LIMIT_BASE_BACKOFF_MS * Math.pow(2, Math.min(consecutive429s - 1, 2)),
-      RATE_LIMIT_MAX_BACKOFF_MS
-    );
-    const bodyRetryAt = extraWaitMs > 0 ? now + extraWaitMs + 1000 : 0;
-    const targetUntil = Math.max(
-      Number.isFinite(headerRetryAt) ? headerRetryAt : 0,
-      bodyRetryAt,
-      now + expBackoff
-    );
-    rateLimitedUntil = Math.max(rateLimitedUntil, targetUntil);
-    changed = true;
-  } else if (res.ok && consecutive429s > 0) {
-    consecutive429s = 0;
-    changed = true;
-  }
-
-  const remaining = parseHeaderNumber(res.headers.get('X-Ratelimit-Remaining'), 'min');
-  const reset = parseHeaderNumber(res.headers.get('X-Ratelimit-Reset'), 'max');
-  if (Number.isFinite(remaining)) {
-    lastRateLimitRemaining = remaining;
-    if (Number.isFinite(reset) && reset > 0) {
-      const resetAt = now + reset * 1000;
-      if (remaining <= BG_RATELIMIT_RESERVE) {
-        bgPausedUntil = Math.max(bgPausedUntil, resetAt);
-        changed = true;
-      }
-      if (remaining <= MIN_RATELIMIT_RESERVE) {
-        hoverPausedUntil = Math.max(hoverPausedUntil, resetAt);
-        changed = true;
-      }
-    }
-  }
-
-  if (changed) persistRateLimitToStorage();
+function isVisibleSubmissionItem(child) {
+  const d = child?.data;
+  if (!d || typeof d !== 'object') return false;
+  if (child.kind && child.kind !== 't3') return false;
+  if (d.removed_by_category || d.removed === true || d.spam === true || d.hidden === true) return false;
+  if (d.author === '[deleted]') return false;
+  return true;
 }
 
-function isAllowedListingRedirect(originalUrl, finalUrlStr) {
-  try {
-    const orig = new URL(originalUrl, location.origin);
-    const dest = new URL(finalUrlStr, location.origin);
-    return (
-      orig.origin === dest.origin &&
-      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(orig.pathname) &&
-      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(dest.pathname)
-    );
-  } catch {
-    return false;
+async function fetchListingBool(url, authorKey, priority) {
+  const data = await enqueueListingRequest(() => fetchJsonDirect(url), authorKey, priority);
+  if (data === null) return null;
+  const children = data?.data?.children;
+  if (data?.kind !== 'Listing' || !Array.isArray(children)) {
+    throw new RequestError('Invalid listing response', { retryable: true });
   }
-}
-
-function requestJson(url, options = {}, priority = false, isRelevant = () => true, queueMeta = {}) {
-  const task = async () => {
-    hydrateRateLimitFromStorage();
-    if (rateLimitedUntil > Date.now()) {
-      const waitSec = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
-      throw new RequestError(`Reddit rate limit active. Please wait ${waitSec}s.`, {
-        status: 429,
-        retryable: true,
-      });
-    }
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, {
-        ...options,
-        credentials: 'same-origin',
-        headers: { Accept: 'application/json', ...options.headers },
-        signal: controller.signal,
-      });
-
-      let bodyWaitMs = 0;
-      if (res.status === 429) {
-        const bodyText = await res.text().catch(() => '');
-        bodyWaitMs = extractWaitMsFromBody(bodyText);
-      }
-      respectRateLimit(res, bodyWaitMs);
-
-      if (!res.ok) {
-        const message =
-          res.status === 429
-            ? 'Reddit rate limit. Please wait before retrying.'
-            : res.status === 401 || res.status === 403
-              ? `Reddit denied access (HTTP ${res.status}). Check that you are signed in.`
-              : `Reddit returned HTTP ${res.status}.`;
-        throw new RequestError(message, {
-          status: res.status,
-          retryable: res.status === 429 || res.status >= 500,
-          uncertain: res.status >= 500,
-        });
-      }
-      if (res.redirected && !isAllowedListingRedirect(url, res.url)) {
-        throw new RequestError('Reddit redirected the request. Check your session.', {
-          retryable: true,
-          uncertain: true,
-        });
-      }
-      if (options.method === 'POST' && res.status === 204) return {};
-      let data;
-      try {
-        data = await res.json();
-      } catch (error) {
-        if (controller.signal.aborted) throw error;
-        throw new RequestError('Reddit returned an unreadable response.', {
-          retryable: true,
-          uncertain: true,
-        });
-      }
-      if (!data || typeof data !== 'object' || Array.isArray(data)) {
-        throw new RequestError('Reddit returned an unexpected response.', {
-          retryable: true,
-          uncertain: true,
-        });
-      }
-      const errors = data.json?.errors ?? data.errors;
-      if (Array.isArray(errors) && errors.length) {
-        const details = errors
-          .map((error) => (Array.isArray(error) ? error.slice(0, 2).join(': ') : String(error)))
-          .join('; ');
-        const limited = errors.some((error) => Array.isArray(error) && error[0] === 'RATELIMIT');
-        if (limited) {
-          const seconds = Number(data.json?.ratelimit);
-          rateLimitedUntil = Math.max(
-            rateLimitedUntil,
-            Date.now() + (seconds > 0 ? seconds * 1000 : RATE_LIMIT_BASE_BACKOFF_MS)
-          );
-          persistRateLimitToStorage();
-        }
-        throw new RequestError(details, { status: limited ? 429 : 0, retryable: limited });
-      }
-      if (data.error || data.success === false) {
-        throw new RequestError(String(data.message || data.error || 'Reddit rejected the request.'));
-      }
-      return data;
-    } catch (error) {
-      if (error instanceof RequestError) throw error;
-      throw new RequestError(
-        controller.signal.aborted ? 'Reddit request timed out.' : 'Network error contacting Reddit.',
-        {
-          retryable: true,
-          uncertain: true,
-        }
-      );
-    } finally {
-      clearTimeout(timeout);
-      controller.abort();
-    }
-  };
-  if (!priority) {
-    return enqueueRequest(task, Boolean(queueMeta.priorityQueue), isRelevant, queueMeta);
-  }
-  return task();
+  return children.some(isVisibleSubmissionItem);
 }
 
 function applyTheme(btn, theme) {
@@ -640,11 +432,8 @@ function bindHoverAndStopPropagation(btn) {
   btn.addEventListener('mouseleave', () => {
     btn.style.background = btn.dataset.bg;
   });
-
   ['pointerdown', 'mousedown', 'mouseup'].forEach((evt) => {
-    btn.addEventListener(evt, (e) => {
-      e.stopPropagation();
-    });
+    btn.addEventListener(evt, (e) => e.stopPropagation());
   });
 }
 
@@ -652,16 +441,115 @@ function setEmptyState(btn, emptyText) {
   btn.dataset.postsState = 'empty';
   applyTheme(btn, EMPTY_THEME);
   btn.textContent = '';
-
   const badge = document.createElement('span');
   badge.style.cssText = BADGE_STYLE;
   badge.textContent = '✕';
-
   const label = document.createElement('span');
   label.textContent = emptyText;
-
   btn.appendChild(badge);
   btn.appendChild(label);
+}
+
+function renderListingState(btn, hasPosts, label, emptyLabel, error = '') {
+  if (!btn) return;
+  btn.dataset.postsState = hasPosts === null ? 'unknown' : hasPosts ? 'present' : 'empty';
+  btn.title = hasPosts === null && error ? `Could not check posts: ${error}` : '';
+  if (hasPosts === false) {
+    setEmptyState(btn, emptyLabel);
+  } else {
+    applyTheme(btn, NORMAL_THEME);
+    btn.textContent = label;
+  }
+}
+
+function syncAuthorButtons(author, status) {
+  if (!author || !status) return;
+  const key = author.toLowerCase();
+  document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
+    if ((wrap.dataset.author || '').toLowerCase() !== key) return;
+    const postsBtn = wrap.querySelector('[data-role="posts"]');
+    const topBtn = wrap.querySelector('[data-role="top"]');
+    if ('hasHot' in status && status.hasHot !== undefined) {
+      renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.error || '');
+    }
+    if ('hasTop' in status && status.hasTop !== undefined) {
+      renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.error || '');
+    }
+  });
+}
+
+function checkAuthorCascade(author, priority = false) {
+  const key = author.toLowerCase();
+  const now = Date.now();
+  const cached = authorCache.get(key);
+  if (cached && cached.expiresAt > now && typeof cached.hasHot === 'boolean') {
+    syncAuthorButtons(author, cached);
+    return Promise.resolve(cached);
+  }
+  if (!priority && (retryAfterMap.get(key) || 0) > now) {
+    return Promise.resolve(null);
+  }
+  if (inFlightChecks.has(key)) {
+    if (priority) {
+      for (const item of fetchQueue) {
+        if (item.authorKey === key) {
+          item.priority = true;
+          item.seq = ++seqCounter;
+        }
+      }
+      processQueue();
+    }
+    return inFlightChecks.get(key);
+  }
+
+  const encoded = encodeURIComponent(author);
+  const topUrl = `${location.origin}/user/${encoded}/submitted.json?limit=5&sort=top&t=all&raw_json=1`;
+  const hotUrl = `${location.origin}/user/${encoded}/submitted.json?limit=5&sort=hot&raw_json=1`;
+
+  const promise = (async () => {
+    try {
+      const hasTop = await fetchListingBool(topUrl, key, priority);
+      if (hasTop === null) return null;
+      if (hasTop === true) {
+        const record = { hasHot: true, hasTop: true, expiresAt: Date.now() + STATUS_TTL_MS };
+        authorCache.set(key, record);
+        retryAfterMap.delete(key);
+        syncAuthorButtons(author, record);
+        persistAuthorCache();
+        return record;
+      }
+      syncAuthorButtons(author, { hasTop: false });
+      const hasHot = await fetchListingBool(hotUrl, key, priority);
+      if (hasHot === null) return null;
+      const record = {
+        hasHot: Boolean(hasHot),
+        hasTop: false,
+        expiresAt: Date.now() + STATUS_TTL_MS,
+      };
+      authorCache.set(key, record);
+      retryAfterMap.delete(key);
+      syncAuthorButtons(author, record);
+      persistAuthorCache();
+      return record;
+    } catch (err) {
+      if (err instanceof RequestError && (err.status === 404 || err.status === 403)) {
+        const record = { hasHot: false, hasTop: false, expiresAt: Date.now() + STATUS_TTL_MS };
+        authorCache.set(key, record);
+        retryAfterMap.delete(key);
+        syncAuthorButtons(author, record);
+        persistAuthorCache();
+        return record;
+      }
+      retryAfterMap.set(key, Math.max(Date.now() + FAILURE_TTL_MS, rateLimitedUntil));
+      syncAuthorButtons(author, { hasHot: null, hasTop: null, error: err?.message || 'Error' });
+      return null;
+    } finally {
+      inFlightChecks.delete(key);
+    }
+  })();
+
+  inFlightChecks.set(key, promise);
+  return promise;
 }
 
 function createLinkBtn(text, url) {
@@ -702,7 +590,6 @@ function createLinkBtn(text, url) {
   btn.addEventListener('auxclick', (e) => {
     if (e.button === 1) activate(e);
   });
-
   return btn;
 }
 
@@ -722,9 +609,8 @@ async function getModhash() {
   const domUh = document.querySelector('input[name="uh"]')?.value;
   if (domUh) return domUh;
   if (cachedModhash) return cachedModhash;
-
   if (!modhashPromise) {
-    modhashPromise = requestJson(`${location.origin}/api/me.json`, {}, true)
+    modhashPromise = fetchJsonDirect(`${location.origin}/api/me.json`)
       .then((d) => {
         const uh = d?.data?.modhash || '';
         if (uh) cachedModhash = uh;
@@ -741,10 +627,8 @@ async function getModhash() {
 async function resolveAccountId(author, initialId) {
   if (/^t2_[a-z0-9]+$/i.test(initialId || '')) return initialId;
   try {
-    const profile = await requestJson(
-      `${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`,
-      {},
-      true
+    const profile = await fetchJsonDirect(
+      `${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`
     );
     const id = profile?.data?.id;
     return typeof id === 'string' && /^[a-z0-9]+$/i.test(id) ? `t2_${id}` : '';
@@ -760,33 +644,24 @@ async function sendBlockPost(author, accountId, uh, csrfToken) {
   if (uh) params.set('uh', uh);
   if (accountId) params.set('account_id', accountId);
 
-  const headers = {
-    'Content-Type': 'application/x-www-form-urlencoded',
-  };
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
   if (uh) headers['X-Modhash'] = uh;
   if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
 
-  await requestJson(
-    `${location.origin}/api/block_user`,
-    {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers,
-      body: params.toString(),
-    },
-    true
-  );
+  await fetchJsonDirect(`${location.origin}/api/block_user`, {
+    method: 'POST',
+    headers,
+    body: params.toString(),
+  });
 }
 
 async function blockAccountRequest(author, authorId) {
   const csrfToken = getCsrfCookie() || getDomToken();
   const validInitialId = /^t2_[a-z0-9]+$/i.test(authorId || '') ? authorId : '';
   const uh = await getModhash();
-
   if (!uh && !csrfToken) {
-    throw new RequestError('No modhash or session token (check that you are logged in).');
+    throw new RequestError('No session token (check that you are signed in).');
   }
-
   try {
     await sendBlockPost(author, validInitialId, uh, csrfToken);
   } catch (firstErr) {
@@ -817,12 +692,6 @@ function enqueueBlockTask(fn) {
   const taskPromise = blockChain.then(run, run);
   blockChain = taskPromise.catch(() => {});
   return taskPromise;
-}
-
-function markAuthorBlockedInDom(author) {
-  blockedAuthors.add(author.toLowerCase());
-  saveBlockedAuthors();
-  updateBlockButtons(author);
 }
 
 function setBlockBtnContent(btn, iconText, labelText) {
@@ -857,9 +726,7 @@ function renderBlockButton(btn, author, error = null) {
     const isLocked = btn.dataset.errorLocked === 'true';
     applyTheme(btn, EMPTY_THEME);
     setBlockBtnContent(btn, '✕', isLocked ? 'Wait...' : 'Retry block');
-    btn.title = `${activeError.message}${
-      activeError.uncertain ? ' Check blocked accounts in Reddit settings before retrying.' : ''
-    }`;
+    btn.title = activeError.message;
     btn.setAttribute('aria-label', btn.title);
     btn.disabled = isLocked;
     btn.style.cursor = isLocked ? 'not-allowed' : 'pointer';
@@ -878,9 +745,7 @@ function updateBlockButtons(author, error = null) {
     const blockBtn = wrap.querySelector('[data-role="block"]');
     if (blockBtn) renderBlockButton(blockBtn, author, error);
     const post = wrap.closest(POST_SELECTOR);
-    if (post && blockedAuthors.has(key)) {
-      dimPost(post);
-    }
+    if (post && blockedAuthors.has(key)) dimPost(post);
   });
 }
 
@@ -909,33 +774,33 @@ function createBlockBtn(author, initialAuthorId) {
   btn.setAttribute('aria-live', 'polite');
   btn.style.cssText = BASE_BTN_STYLE;
   bindHoverAndStopPropagation(btn);
-
   renderBlockButton(btn, author);
 
   btn.addEventListener('click', async (e) => {
     e.preventDefault();
     e.stopPropagation();
     e.stopImmediatePropagation();
-    const key = author.toLowerCase();
+    const wrap = btn.closest(`.${WRAP_CLASS}`);
+    const currentAuthor = wrap?.dataset?.author || author;
+    const currentAuthorId = wrap?.dataset?.authorId || initialAuthorId;
+    const key = currentAuthor.toLowerCase();
     if (btn.disabled || pendingBlocks.has(key) || blockedAuthors.has(key)) return;
-
-    const currentAuthorId = btn.closest(`.${WRAP_CLASS}`)?.dataset.authorId || initialAuthorId;
 
     authorErrors.delete(key);
     pendingBlocks.add(key);
-    updateBlockButtons(author);
+    updateBlockButtons(currentAuthor);
     processQueue();
 
     let failure = null;
     try {
-      await enqueueBlockTask(() => blockAccountRequest(author, currentAuthorId));
-      markAuthorBlockedInDom(author);
-    } catch (error) {
-      failure = error;
-      authorErrors.set(key, error);
-      if (error.status === 401 || error.status === 403) {
-        cachedModhash = '';
-      }
+      await enqueueBlockTask(() => blockAccountRequest(currentAuthor, currentAuthorId));
+      blockedAuthors.add(key);
+      saveBlockedAuthors();
+      updateBlockButtons(currentAuthor);
+    } catch (err) {
+      failure = err;
+      authorErrors.set(key, err);
+      if (err.status === 401 || err.status === 403) cachedModhash = '';
     } finally {
       pendingBlocks.delete(key);
       if (failure) {
@@ -943,350 +808,72 @@ function createBlockBtn(author, initialAuthorId) {
           failure.status === 429
             ? Math.min(Math.max(rateLimitedUntil - Date.now(), ERROR_LOCK_MS), 15000)
             : ERROR_LOCK_MS;
-        lockAuthorButtonsTemporarily(author, lockMs);
+        lockAuthorButtonsTemporarily(currentAuthor, lockMs);
       } else {
-        updateBlockButtons(author, null);
+        updateBlockButtons(currentAuthor, null);
       }
       processQueue();
     }
   });
-
   return btn;
 }
 
-async function checkListingHasPosts(url, priority = false, isRelevant = () => true, queueMeta = {}) {
-  const data = await requestJson(url, {}, false, isRelevant, {
-    ...queueMeta,
-    priorityQueue: Boolean(priority || queueMeta.priorityQueue),
-  });
-  const children = data?.data?.children;
-  if (data?.kind !== 'Listing' || !Array.isArray(children)) {
-    throw new RequestError('Reddit returned an invalid post listing.', { retryable: true });
+function clearWrapTimers(wrap) {
+  const dTimer = dwellTimers.get(wrap);
+  if (dTimer !== undefined) {
+    clearTimeout(dTimer);
+    dwellTimers.delete(wrap);
   }
-
-  return children.length > 0;
-}
-
-function syncAuthorListingButtonsInDom(author, status) {
-  if (!author || !status) return;
-  const key = author.toLowerCase();
-  document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
-    if ((wrap.dataset.author || '').toLowerCase() !== key) return;
-    const postsBtn = wrap.querySelector('[data-role="posts"]');
-    const topBtn = wrap.querySelector('[data-role="top"]');
-    if ('hasHot' in status && status.hasHot !== undefined) {
-      renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError || '');
-    }
-    if ('hasTop' in status && status.hasTop !== undefined) {
-      renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.topError || '');
-    }
-  });
-}
-
-function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
-  const key = author.toLowerCase();
-  const cached = authorCache.get(key);
-  const now = Date.now();
-
-  if (cached && cached.settledStatus && cached.expiresAt > now) {
-    if (onHot) {
-      Promise.resolve(cached.settledStatus).then((hot) => {
-        if (!hot.cancelled) onHot(hot);
-      });
-    }
-    return cached.promise;
-  }
-
-  if (cached && cached.expiresAt === Infinity && cached.promise) {
-    if (isRelevant) cached.consumers.add(isRelevant);
-    else cached.unscoped = true;
-    if (priority && !cached.priority) {
-      cached.priority = true;
-      promoteAuthorInQueue(key);
-    }
-    if (onHot && cached.hotPromise) {
-      cached.hotPromise.then((hot) => {
-        if (!hot.cancelled) onHot(hot);
-      });
-    }
-    return cached.promise;
-  }
-
-  const encoded = encodeURIComponent(author);
-  const preservedHot =
-    cached && cached.hotResult && typeof cached.hotResult.hasHot === 'boolean' && cached.expiresAt > now
-      ? cached.hotResult
-      : null;
-
-  const entry = {
-    expiresAt: Infinity,
-    retryAfterAt: 0,
-    hotResult: preservedHot,
-    hotPromise: null,
-    promise: null,
-    consumers: new Set(isRelevant ? [isRelevant] : []),
-    unscoped: !isRelevant,
-    priority: Boolean(priority),
-    settledStatus: null,
-  };
-  const needed = () =>
-    !blockedAuthors.has(key) && (entry.unscoped || [...entry.consumers].some((check) => check()));
-
-  if (preservedHot) {
-    entry.hotPromise = Promise.resolve(preservedHot);
-  } else {
-    entry.hotPromise = checkListingHasPosts(
-      `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=hot&include_over_18=on&raw_json=1`,
-      entry.priority,
-      needed,
-      { authorKey: key, priorityQueue: entry.priority }
-    ).then(
-      (value) => {
-        const res = { hasHot: value, hotError: '', retryable: false };
-        entry.hotResult = res;
-        syncAuthorListingButtonsInDom(author, { hasHot: value, hotError: '' });
-        return res;
-      },
-      (error) => {
-        if (error instanceof CancelledCheck) return { cancelled: true };
-        if (error instanceof RequestError && error.status === 404) {
-          const res404 = { hasHot: false, hotError: '', retryable: false, emptyProfile: true };
-          entry.hotResult = res404;
-          syncAuthorListingButtonsInDom(author, { hasHot: false, hotError: '' });
-          return res404;
-        }
-        return {
-          hasHot: null,
-          hotError: error.message,
-          status: error.status || 0,
-          retryable: error.retryable,
-        };
-      }
-    );
-  }
-
-  if (onHot) {
-    entry.hotPromise.then((hot) => {
-      if (!hot.cancelled) onHot(hot);
-    });
-  }
-
-  entry.promise = entry.hotPromise
-    .then(async (hot) => {
-      if (hot.cancelled) return hot;
-      let top;
-      if (hot.hasHot === true) {
-        // A visible submitted post also belongs to the all-time top listing.
-        top = { hasTop: true, topError: '', retryable: false };
-      } else if (hot.emptyProfile) {
-        top = { hasTop: false, topError: '', retryable: false };
-      } else if (hot.hasHot === null) {
-        top = {
-          hasTop: null,
-          topError: hot.hotError,
-          status: hot.status || 0,
-          retryable: hot.retryable,
-        };
-      } else {
-        try {
-          top = {
-            hasTop: await checkListingHasPosts(
-              `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=top&t=all&include_over_18=on&raw_json=1`,
-              true,
-              needed,
-              { authorKey: key, priorityQueue: true, continuation: true }
-            ),
-            topError: '',
-            retryable: false,
-          };
-        } catch (error) {
-          if (error instanceof CancelledCheck) {
-            return { cancelled: true, hotPreserved: true, hasHot: hot.hasHot, hotError: '' };
-          }
-          if (error instanceof RequestError && error.status === 404) {
-            top = { hasTop: false, topError: '', retryable: false };
-          } else {
-            top = {
-              hasTop: null,
-              topError: error.message,
-              status: error.status || 0,
-              retryable: error.retryable,
-            };
-          }
-        }
-      }
-      const failed = hot.hasHot === null || top.hasTop === null;
-      const is429 = hot.status === 429 || top.status === 429;
-      const nowEnd = Date.now();
-      entry.expiresAt = failed
-        ? Math.max(nowEnd + FAILURE_TTL_MS, rateLimitedUntil)
-        : nowEnd + STATUS_TTL_MS;
-      entry.retryAfterAt = failed ? entry.expiresAt : 0;
-
-      for (const [oldKey, oldEntry] of authorCache) {
-        if (authorCache.size <= MAX_CACHE_SIZE) break;
-        if (oldEntry.expiresAt !== Infinity) authorCache.delete(oldKey);
-      }
-      const result = {
-        hasHot: hot.hasHot,
-        hotError: hot.hotError || '',
-        hasTop: top.hasTop,
-        topError: top.topError || '',
-        rateLimited: is429,
-        retryable: Boolean(hot.retryable || top.retryable),
-        retryAt: entry.expiresAt,
-      };
-      if (!failed) {
-        entry.settledStatus = result;
-        syncAuthorListingButtonsInDom(author, result);
-        schedulePersistAuthorCache();
-      } else if (typeof hot.hasHot === 'boolean') {
-        entry.expiresAt = nowEnd + STATUS_TTL_MS;
-        syncAuthorListingButtonsInDom(author, { hasHot: hot.hasHot, hotError: '' });
-        schedulePersistAuthorCache();
-      }
-      return result;
-    })
-    .then((status) => {
-      entry.consumers.clear();
-      if (status.cancelled) {
-        if (entry.hotResult && typeof entry.hotResult.hasHot === 'boolean') {
-          entry.expiresAt = Date.now() + STATUS_TTL_MS;
-          entry.retryAfterAt = 0;
-          entry.promise = null;
-          schedulePersistAuthorCache();
-        } else if (authorCache.get(key) === entry) {
-          authorCache.delete(key);
-        }
-      }
-      return status;
-    });
-
-  authorCache.set(key, entry);
-  return entry.promise;
-}
-
-function renderListingState(btn, hasPosts, label, emptyLabel, error) {
-  if (!btn) return;
-  btn.dataset.postsState = hasPosts === null ? 'unknown' : hasPosts ? 'present' : 'empty';
-  btn.title = hasPosts === null && error ? `Could not check posts: ${error}` : '';
-  if (hasPosts === false) setEmptyState(btn, emptyLabel);
-  else {
-    applyTheme(btn, NORMAL_THEME);
-    btn.textContent = label;
+  const hTimer = hoverTimers.get(wrap);
+  if (hTimer !== undefined) {
+    clearTimeout(hTimer);
+    hoverTimers.delete(wrap);
   }
 }
 
-async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
-  const author = wrap.dataset.author;
-  if (!author || blockedAuthors.has(author.toLowerCase())) return;
-  if (wrap.dataset.statusChecking === 'true') {
-    if (priority) promoteAuthorInQueue(author.toLowerCase());
-    return;
-  }
-  wrap.dataset.statusChecking = 'true';
+function applyCachedStatusToWrap(wrap, author) {
+  const cached = authorCache.get(author.toLowerCase());
+  if (!cached || cached.expiresAt <= Date.now()) return false;
   const postsBtn = wrap.querySelector('[data-role="posts"]');
   const topBtn = wrap.querySelector('[data-role="top"]');
-  let cancelled = false;
-  try {
-    const status = await getAuthorStatus(
-      author,
-      (hot) => {
-        if (wrap.isConnected && wrap.dataset.author === author) {
-          renderListingState(postsBtn, hot.hasHot, 'Posts', 'No posts', hot.hotError);
-        }
-      },
-      () => wrap.isConnected && wrap.dataset.author === author && wrap.dataset.nearby === 'true',
-      priority
-    );
-    if (status.cancelled) {
-      cancelled = true;
-      if (typeof status.hasHot === 'boolean' && wrap.isConnected && wrap.dataset.author === author) {
-        renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError || '');
+  if (typeof cached.hasHot === 'boolean' && typeof cached.hasTop === 'boolean') {
+    renderListingState(postsBtn, cached.hasHot, 'Posts', 'No posts', '');
+    renderListingState(topBtn, cached.hasTop, 'Top posts', 'No top', '');
+    return true;
+  }
+  return false;
+}
+
+function handleVisibilityChange(wrap, isIntersecting) {
+  if (!wrap) return;
+  wrap.dataset.nearby = String(isIntersecting);
+  if (!isIntersecting) {
+    clearWrapTimers(wrap);
+    return;
+  }
+  const author = wrap.dataset.author || '';
+  if (!author || blockedAuthors.has(author.toLowerCase())) return;
+  if (applyCachedStatusToWrap(wrap, author)) return;
+
+  if (!dwellTimers.has(wrap)) {
+    const timer = setTimeout(() => {
+      dwellTimers.delete(wrap);
+      if (wrap.isConnected && wrap.dataset.nearby === 'true') {
+        checkAuthorCascade(author, false);
       }
-      return;
-    }
-    if (!wrap.isConnected || wrap.dataset.author !== author) return;
-    renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError);
-    renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.topError);
-
-    // Do NOT schedule per-card retry timers on HTTP 429 (queue/dwell handles recovery cleanly).
-    if (canRetry && status.retryable && !status.rateLimited && wrap.dataset.statusRetry !== 'true') {
-      wrap.dataset.statusRetry = 'true';
-      setTimeout(() => {
-        if (wrap.isConnected && wrap.dataset.author === author) {
-          requestVisibleStatus(wrap);
-        }
-      }, Math.min(Math.max(status.retryAt - Date.now(), 0) + 50, 2147483647));
-    }
-  } finally {
-    wrap.dataset.statusChecking = 'false';
-    if (cancelled && wrap.isConnected && wrap.dataset.nearby === 'true') {
-      requestVisibleStatus(wrap);
-    }
-  }
-}
-
-function requestVisibleStatus(wrap) {
-  if (!wrap.isConnected || document.visibilityState === 'hidden' || wrap.dataset.nearby !== 'true') {
-    return;
-  }
-  const key = (wrap.dataset.author || '').toLowerCase();
-  if (!key || blockedAuthors.has(key)) return;
-  if (wrap.dataset.statusChecking === 'true') return;
-
-  const now = Date.now();
-  const cached = authorCache.get(key);
-  if (cached && cached.settledStatus && cached.expiresAt > now) {
-    const postsBtn = wrap.querySelector('[data-role="posts"]');
-    const topBtn = wrap.querySelector('[data-role="top"]');
-    renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
-    renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
-    return;
-  }
-
-  if (cached && cached.expiresAt !== Infinity && cached.retryAfterAt > now) {
-    return;
-  }
-
-  if (rateLimitedUntil > now || bgPausedUntil > now) {
-    return;
-  }
-
-  updateAuthorStatus(wrap, wrap.dataset.statusRetry !== 'true', false);
-}
-
-function clearDwellTimer(wrap) {
-  const timer = dwellTimers.get(wrap);
-  if (timer !== undefined) {
-    clearTimeout(timer);
-    dwellTimers.delete(wrap);
+    }, VIEWPORT_DWELL_MS);
+    dwellTimers.set(wrap, timer);
   }
 }
 
 const visibilityObserver = new IntersectionObserver(
   (entries) => {
     entries.forEach((entry) => {
-      const wrap = entry.target;
-      wrap.dataset.nearby = String(entry.isIntersecting);
-      clearDwellTimer(wrap);
-
-      if (entry.isIntersecting) {
-        const key = (wrap.dataset.author || '').toLowerCase();
-        const cached = authorCache.get(key);
-        const now = Date.now();
-        if (cached && cached.settledStatus && cached.expiresAt > now) {
-          requestVisibleStatus(wrap);
-        } else {
-          const timer = setTimeout(() => {
-            dwellTimers.delete(wrap);
-            if (wrap.isConnected && wrap.dataset.nearby === 'true') {
-              requestVisibleStatus(wrap);
-            }
-          }, VIEWPORT_DWELL_MS);
-          dwellTimers.set(wrap, timer);
-        }
-      }
+      const target = entry.target;
+      const wrap = target.classList?.contains(WRAP_CLASS)
+        ? target
+        : postToWrapMap.get(target) || findOwnWrap(target);
+      if (wrap) handleVisibilityChange(wrap, entry.isIntersecting);
     });
     processQueue();
   },
@@ -1295,7 +882,7 @@ const visibilityObserver = new IntersectionObserver(
 
 function normalizeAuthor(raw) {
   if (!raw) return '';
-  return raw.trim().replace(/^u\//i, '');
+  return raw.trim().replace(/^(?:\/?(?:u|user)\/)/i, '');
 }
 
 function extractAuthorId(post, modern) {
@@ -1337,20 +924,20 @@ function extractAuthorFromBar(post, bar) {
   return '';
 }
 
-function applyCachedAuthorStatusToWrap(wrap, author) {
-  const cached = authorCache.get(author.toLowerCase());
-  if (!cached || cached.expiresAt <= Date.now()) return;
-  const postsBtn = wrap.querySelector('[data-role="posts"]');
-  const topBtn = wrap.querySelector('[data-role="top"]');
-  if (cached.settledStatus) {
-    renderListingState(postsBtn, cached.settledStatus.hasHot, 'Posts', 'No posts', '');
-    renderListingState(topBtn, cached.settledStatus.hasTop, 'Top posts', 'No top', '');
-  } else if (cached.hotResult && typeof cached.hotResult.hasHot === 'boolean') {
-    renderListingState(postsBtn, cached.hotResult.hasHot, 'Posts', 'No posts', '');
-  }
+function dimPost(post) {
+  if (!dimmedPosts.has(post)) dimmedPosts.set(post, post.style.opacity);
+  post.style.opacity = '0.35';
 }
 
-function createBtnGroup(author, authorId) {
+function findOwnWrap(post) {
+  const wraps = post.querySelectorAll(`.${WRAP_CLASS}`);
+  for (const wrap of wraps) {
+    if (wrap.closest(POST_SELECTOR) === post) return wrap;
+  }
+  return null;
+}
+
+function createBtnGroup(author, authorId, post = null) {
   const encoded = encodeURIComponent(author);
   const wrap = document.createElement('span');
   wrap.className = WRAP_CLASS;
@@ -1371,109 +958,41 @@ function createBtnGroup(author, authorId) {
   wrap.appendChild(topBtn);
   wrap.appendChild(blockBtn);
 
-  applyCachedAuthorStatusToWrap(wrap, author);
-  visibilityObserver.observe(wrap);
+  applyCachedStatusToWrap(wrap, author);
+  const observeTarget = post || wrap;
+  if (post) postToWrapMap.set(post, wrap);
+  visibilityObserver.observe(observeTarget);
 
-  const checkOnIntent = () => {
-    clearDwellTimer(wrap);
-    const key = author.toLowerCase();
-    if (wrap.dataset.statusChecking === 'true') {
-      promoteAuthorInQueue(key);
-      return;
+  const cancelHover = () => {
+    const hTimer = hoverTimers.get(wrap);
+    if (hTimer !== undefined) {
+      clearTimeout(hTimer);
+      hoverTimers.delete(wrap);
     }
-    const now = Date.now();
-    const entry = authorCache.get(key);
-    if (entry && entry.settledStatus && entry.expiresAt > now) {
-      renderListingState(postsBtn, entry.settledStatus.hasHot, 'Posts', 'No posts', '');
-      renderListingState(topBtn, entry.settledStatus.hasTop, 'Top posts', 'No top', '');
-      return;
-    }
-    if (rateLimitedUntil > now || hoverPausedUntil > now) {
-      return;
-    }
-    wrap.dataset.nearby = 'true';
-    updateAuthorStatus(wrap, false, true);
   };
+
+  const scheduleHover = () => {
+    cancelHover();
+    if (applyCachedStatusToWrap(wrap, author)) return;
+    const timer = setTimeout(() => {
+      hoverTimers.delete(wrap);
+      wrap.dataset.nearby = 'true';
+      checkAuthorCascade(author, true);
+    }, HOVER_DEBOUNCE_MS);
+    hoverTimers.set(wrap, timer);
+  };
+
   [postsBtn, topBtn].forEach((btn) => {
-    btn.addEventListener('pointerenter', checkOnIntent);
-    btn.addEventListener('focus', checkOnIntent);
+    btn.addEventListener('pointerenter', scheduleHover);
+    btn.addEventListener('focus', scheduleHover);
+    btn.addEventListener('pointerleave', cancelHover);
+    btn.addEventListener('blur', cancelHover);
+    btn.addEventListener('pointerdown', cancelHover);
+    btn.addEventListener('click', cancelHover);
+    btn.addEventListener('auxclick', cancelHover);
   });
+
   return wrap;
-}
-
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    hydrateRateLimitFromStorage();
-    document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
-      visibilityObserver.unobserve(wrap);
-      visibilityObserver.observe(wrap);
-    });
-    processQueue();
-  } else {
-    persistAuthorCacheToSession();
-    document.querySelectorAll(`.${WRAP_CLASS}`).forEach(clearDwellTimer);
-    processQueue();
-  }
-});
-
-if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-  window.addEventListener('pagehide', () => {
-    persistAuthorCacheToSession();
-  });
-
-  window.addEventListener('storage', (e) => {
-    if (!e || !e.key) return;
-    if (e.key === STATUS_STORAGE_KEY && e.newValue) {
-      try {
-        const parsed = JSON.parse(e.newValue);
-        if (!parsed || typeof parsed !== 'object') return;
-        const now = Date.now();
-        for (const [key, val] of Object.entries(parsed)) {
-          const lower = key.toLowerCase();
-          applyHydratedAuthorRecord(lower, val, now);
-          const entry = authorCache.get(lower);
-          if (entry?.settledStatus) {
-            syncAuthorListingButtonsInDom(lower, entry.settledStatus);
-          } else if (entry?.hotResult) {
-            syncAuthorListingButtonsInDom(lower, entry.hotResult);
-          }
-        }
-      } catch {
-        // Ignore malformed storage event payload.
-      }
-    } else if (e.key === BLOCKED_STORAGE_KEY && e.newValue) {
-      try {
-        const parsed = JSON.parse(e.newValue);
-        if (Array.isArray(parsed)) {
-          parsed.forEach((a) => {
-            const lower = String(a).toLowerCase();
-            blockedAuthors.add(lower);
-            updateBlockButtons(lower);
-          });
-        }
-      } catch {
-        // Ignore malformed blocked list.
-      }
-    } else if (e.key === RATELIMIT_STORAGE_KEY && e.newValue) {
-      hydrateRateLimitFromStorage();
-      processQueue();
-    }
-  });
-}
-
-const dimmedPosts = new WeakMap();
-
-function dimPost(post) {
-  if (!dimmedPosts.has(post)) dimmedPosts.set(post, post.style.opacity);
-  post.style.opacity = '0.35';
-}
-
-function findOwnWrap(post) {
-  const wraps = post.querySelectorAll(`.${WRAP_CLASS}`);
-  for (const wrap of wraps) {
-    if (wrap.closest(POST_SELECTOR) === post) return wrap;
-  }
-  return null;
 }
 
 function processPost(post) {
@@ -1493,26 +1012,24 @@ function processPost(post) {
   const existing = findOwnWrap(post);
   if (existing) {
     if (existing.dataset.author === author) {
-      if (existing.dataset.authorId !== authorId) {
+      if (authorId && existing.dataset.authorId !== authorId) {
         existing.dataset.authorId = authorId;
       }
-      applyCachedAuthorStatusToWrap(existing, author);
-      if (detachedWraps.has(existing)) {
-        detachedWraps.delete(existing);
-        visibilityObserver.observe(existing);
-      }
+      postToWrapMap.set(post, existing);
+      applyCachedStatusToWrap(existing, author);
       return;
     }
-    clearDwellTimer(existing);
-    existing.dataset.nearby = 'false';
+    clearWrapTimers(existing);
+    visibilityObserver.unobserve(post);
     visibilityObserver.unobserve(existing);
+    postToWrapMap.delete(post);
     existing.remove();
     processQueue();
   }
 
   if (!author || author === '[deleted]' || !bar) return;
 
-  const wrap = createBtnGroup(author, authorId);
+  const wrap = createBtnGroup(author, authorId, post);
   if (modern) {
     post.style.isolation = 'isolate';
     bar.style.display = 'flex';
@@ -1530,7 +1047,43 @@ function processPost(post) {
   } else {
     bar.appendChild(wrap);
   }
+
   if (blockedAuthors.has(author.toLowerCase())) dimPost(post);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    hydrateRateLimit();
+    hydrateAuthorCache();
+    processQueue();
+  } else {
+    persistAuthorCache();
+    document.querySelectorAll(`.${WRAP_CLASS}`).forEach(clearWrapTimers);
+  }
+});
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('pagehide', () => persistAuthorCache());
+  window.addEventListener('storage', (e) => {
+    if (!e || !e.key) return;
+    if (e.key === STATUS_STORAGE_KEY && e.newValue) {
+      hydrateAuthorCache();
+      for (const [k, v] of authorCache.entries()) {
+        syncAuthorButtons(k, v);
+      }
+    } else if (e.key === BLOCKED_STORAGE_KEY && e.newValue) {
+      try {
+        JSON.parse(e.newValue).forEach((a) => {
+          const lower = String(a).toLowerCase();
+          blockedAuthors.add(lower);
+          updateBlockButtons(lower);
+        });
+      } catch {}
+    } else if (e.key === RATELIMIT_STORAGE_KEY && e.newValue) {
+      hydrateRateLimit();
+      processQueue();
+    }
+  });
 }
 
 let rafScheduled = false;
@@ -1541,35 +1094,20 @@ function collectPosts(node) {
   if (node.matches(POST_SELECTOR)) pendingPosts.add(node);
   const parentPost = node.closest(POST_SELECTOR);
   if (parentPost) pendingPosts.add(parentPost);
-  node.querySelectorAll(POST_SELECTOR).forEach((post) => pendingPosts.add(post));
+  node.querySelectorAll(POST_SELECTOR).forEach((p) => pendingPosts.add(p));
 }
 
 function scheduleProcessPosts(mutations) {
-  let detached = false;
-  for (const mutation of mutations) {
-    if (mutation.target.nodeType === 1 && mutation.target.closest(`.${WRAP_CLASS}`)) continue;
-    if (mutation.type === 'attributes') {
-      collectPosts(mutation.target);
+  for (const m of mutations) {
+    if (m.target.nodeType === 1 && m.target.closest(`.${WRAP_CLASS}`)) continue;
+    if (m.type === 'attributes') {
+      collectPosts(m.target);
       continue;
     }
-    const parentPost =
-      mutation.target.nodeType === 1 ? mutation.target.closest(POST_SELECTOR) : null;
+    const parentPost = m.target.nodeType === 1 ? m.target.closest(POST_SELECTOR) : null;
     if (parentPost) pendingPosts.add(parentPost);
-    mutation.addedNodes.forEach(collectPosts);
-    mutation.removedNodes.forEach((node) => {
-      if (node.nodeType !== 1 || node.isConnected) return;
-      const detach = (wrap) => {
-        clearDwellTimer(wrap);
-        wrap.dataset.nearby = 'false';
-        visibilityObserver.unobserve(wrap);
-        detachedWraps.add(wrap);
-        detached = true;
-      };
-      if (node.matches(`.${WRAP_CLASS}`)) detach(node);
-      node.querySelectorAll(`.${WRAP_CLASS}`).forEach(detach);
-    });
+    m.addedNodes.forEach(collectPosts);
   }
-  if (detached) processQueue();
   if (rafScheduled || pendingPosts.size === 0) return;
   rafScheduled = true;
   requestAnimationFrame(() => {
