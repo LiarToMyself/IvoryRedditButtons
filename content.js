@@ -40,23 +40,23 @@ const BADGE_STYLE =
 
 const MAX_CONCURRENT = 1;
 const REQUEST_TIMEOUT_MS = 15000;
-const REQUEST_INTERVAL_MS = 2200;
-const PRIORITY_INTERVAL_MS = 1200;
-const VIEWPORT_DWELL_MS = 900;
+const REQUEST_INTERVAL_MS = 2500;
+const PRIORITY_INTERVAL_MS = 400;
+const VIEWPORT_DWELL_MS = 1000;
 const STATUS_TTL_MS = 60 * 60 * 1000;
 const FAILURE_TTL_MS = 60 * 1000;
-const RATE_LIMIT_BASE_BACKOFF_MS = 5 * 60 * 1000;
+const RATE_LIMIT_BASE_BACKOFF_MS = 10 * 60 * 1000;
 const RATE_LIMIT_MAX_BACKOFF_MS = 15 * 60 * 1000;
 const MAX_CACHE_SIZE = 1000;
 const PREFETCH_MARGIN_PX = 40;
 const BLOCK_COOLDOWN_MS = 1500;
 const ERROR_LOCK_MS = 2000;
-const BG_RATELIMIT_RESERVE = 25;
-const MIN_RATELIMIT_RESERVE = 5;
+const BG_RATELIMIT_RESERVE = 30;
+const MIN_RATELIMIT_RESERVE = 10;
 const BG_WINDOW_SHORT_MS = 60 * 1000;
-const BG_MAX_PER_MIN = 10;
+const BG_MAX_PER_MIN = 3;
 const BG_WINDOW_LONG_MS = 10 * 60 * 1000;
-const BG_MAX_PER_10MIN = 45;
+const BG_MAX_PER_10MIN = 18;
 const PERSIST_DEBOUNCE_MS = 500;
 
 const authorCache = new Map();
@@ -338,8 +338,8 @@ function extractWaitMsFromBody(bodyText) {
   return 0;
 }
 
-function getAdaptiveIntervalMs(isPriorityOrContinuation) {
-  if (isPriorityOrContinuation) return PRIORITY_INTERVAL_MS;
+function getAdaptiveIntervalMs(isPriority) {
+  if (isPriority) return PRIORITY_INTERVAL_MS;
   if (lastRateLimitRemaining !== null && Number.isFinite(lastRateLimitRemaining)) {
     if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 10) return 3600;
     if (lastRateLimitRemaining <= BG_RATELIMIT_RESERVE + 25) return 2800;
@@ -367,7 +367,7 @@ function getBgBudgetResumeAt(now) {
 }
 
 function getEntryBlockedUntil(entry, now = Date.now()) {
-  if (entry.continuation || entry.priority) {
+  if (entry.priority) {
     return Math.max(nextRequestAt, rateLimitedUntil, hoverPausedUntil);
   }
   return Math.max(nextRequestAt, rateLimitedUntil, bgPausedUntil, getBgBudgetResumeAt(now));
@@ -381,10 +381,9 @@ function enqueueRequest(task, priority = false, isRelevant = () => true, meta = 
       reject,
       isRelevant,
       priority: Boolean(priority),
-      continuation: Boolean(meta.continuation),
       authorKey: meta.authorKey ? String(meta.authorKey).toLowerCase() : '',
     };
-    if (entry.continuation || entry.priority) {
+    if (entry.priority) {
       fetchQueue.unshift(entry);
     } else {
       fetchQueue.push(entry);
@@ -449,7 +448,7 @@ function processQueue() {
   activeRequests++;
   const startedAt = Date.now();
   recentBgTimestamps.push(startedAt);
-  nextRequestAt = startedAt + getAdaptiveIntervalMs(entry.priority || entry.continuation);
+  nextRequestAt = startedAt + getAdaptiveIntervalMs(entry.priority);
   persistRateLimitToStorage();
 
   Promise.resolve()
@@ -493,7 +492,7 @@ function respectRateLimit(res, extraWaitMs = 0) {
   if (Number.isFinite(remaining)) {
     lastRateLimitRemaining = remaining;
     if (Number.isFinite(reset) && reset > 0) {
-      const resetAt = now + reset * 1000;
+      const resetAt = now + Math.min(reset * 1000, 120 * 1000);
       if (remaining <= BG_RATELIMIT_RESERVE) {
         bgPausedUntil = Math.max(bgPausedUntil, resetAt);
         changed = true;
@@ -954,6 +953,17 @@ function createBlockBtn(author, initialAuthorId) {
   return btn;
 }
 
+function isVisibleSubmissionItem(child) {
+  if (!child || typeof child !== 'object') return false;
+  const d = child.data;
+  if (!d || typeof d !== 'object') return false;
+  if (child.kind && child.kind !== 't3') return false;
+  if (d.removed_by_category) return false;
+  if (d.removed === true || d.spam === true || d.hidden === true) return false;
+  if (typeof d.author === 'string' && d.author === '[deleted]') return false;
+  return true;
+}
+
 async function checkListingHasPosts(url, priority = false, isRelevant = () => true, queueMeta = {}) {
   const data = await requestJson(url, {}, false, isRelevant, {
     ...queueMeta,
@@ -964,7 +974,7 @@ async function checkListingHasPosts(url, priority = false, isRelevant = () => tr
     throw new RequestError('Reddit returned an invalid post listing.', { retryable: true });
   }
 
-  return children.length > 0;
+  return children.some(isVisibleSubmissionItem);
 }
 
 function syncAuthorListingButtonsInDom(author, status) {
@@ -1036,7 +1046,7 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
     entry.hotPromise = Promise.resolve(preservedHot);
   } else {
     entry.hotPromise = checkListingHasPosts(
-      `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=hot&include_over_18=on&raw_json=1`,
+      `${location.origin}/user/${encoded}/submitted.json?limit=5&sort=hot&raw_json=1`,
       entry.priority,
       needed,
       { authorKey: key, priorityQueue: entry.priority }
@@ -1044,16 +1054,26 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
       (value) => {
         const res = { hasHot: value, hotError: '', retryable: false };
         entry.hotResult = res;
-        syncAuthorListingButtonsInDom(author, { hasHot: value, hotError: '' });
+        syncAuthorListingButtonsInDom(author, {
+          hasHot: value,
+          hotError: '',
+          hasTop: value,
+          topError: '',
+        });
         return res;
       },
       (error) => {
         if (error instanceof CancelledCheck) return { cancelled: true };
-        if (error instanceof RequestError && error.status === 404) {
-          const res404 = { hasHot: false, hotError: '', retryable: false, emptyProfile: true };
-          entry.hotResult = res404;
-          syncAuthorListingButtonsInDom(author, { hasHot: false, hotError: '' });
-          return res404;
+        if (error instanceof RequestError && (error.status === 404 || error.status === 403)) {
+          const resEmpty = { hasHot: false, hotError: '', retryable: false, emptyProfile: true };
+          entry.hotResult = resEmpty;
+          syncAuthorListingButtonsInDom(author, {
+            hasHot: false,
+            hotError: '',
+            hasTop: false,
+            topError: '',
+          });
+          return resEmpty;
         }
         return {
           hasHot: null,
@@ -1074,49 +1094,12 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
   entry.promise = entry.hotPromise
     .then(async (hot) => {
       if (hot.cancelled) return hot;
-      let top;
-      if (hot.hasHot === true) {
-        // A visible submitted post also belongs to the all-time top listing.
-        top = { hasTop: true, topError: '', retryable: false };
-      } else if (hot.emptyProfile) {
-        top = { hasTop: false, topError: '', retryable: false };
-      } else if (hot.hasHot === null) {
-        top = {
-          hasTop: null,
-          topError: hot.hotError,
-          status: hot.status || 0,
-          retryable: hot.retryable,
-        };
-      } else {
-        try {
-          top = {
-            hasTop: await checkListingHasPosts(
-              `${location.origin}/user/${encoded}/submitted.json?limit=1&sort=top&t=all&include_over_18=on&raw_json=1`,
-              true,
-              needed,
-              { authorKey: key, priorityQueue: true, continuation: true }
-            ),
-            topError: '',
-            retryable: false,
-          };
-        } catch (error) {
-          if (error instanceof CancelledCheck) {
-            return { cancelled: true, hotPreserved: true, hasHot: hot.hasHot, hotError: '' };
-          }
-          if (error instanceof RequestError && error.status === 404) {
-            top = { hasTop: false, topError: '', retryable: false };
-          } else {
-            top = {
-              hasTop: null,
-              topError: error.message,
-              status: error.status || 0,
-              retryable: error.retryable,
-            };
-          }
-        }
-      }
-      const failed = hot.hasHot === null || top.hasTop === null;
-      const is429 = hot.status === 429 || top.status === 429;
+      const failed = hot.hasHot === null;
+      const is429 = hot.status === 429;
+      const top = failed
+        ? { hasTop: null, topError: hot.hotError, status: hot.status || 0, retryable: hot.retryable }
+        : { hasTop: Boolean(hot.hasHot), topError: '', retryable: false };
+
       const nowEnd = Date.now();
       entry.expiresAt = failed
         ? Math.max(nowEnd + FAILURE_TTL_MS, rateLimitedUntil)
@@ -1142,7 +1125,12 @@ function getAuthorStatus(author, onHot, isRelevant = null, priority = false) {
         schedulePersistAuthorCache();
       } else if (typeof hot.hasHot === 'boolean') {
         entry.expiresAt = nowEnd + STATUS_TTL_MS;
-        syncAuthorListingButtonsInDom(author, { hasHot: hot.hasHot, hotError: '' });
+        syncAuthorListingButtonsInDom(author, {
+          hasHot: hot.hasHot,
+          hotError: '',
+          hasTop: hot.hasHot,
+          topError: '',
+        });
         schedulePersistAuthorCache();
       }
       return result;
@@ -1194,6 +1182,9 @@ async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
       (hot) => {
         if (wrap.isConnected && wrap.dataset.author === author) {
           renderListingState(postsBtn, hot.hasHot, 'Posts', 'No posts', hot.hotError);
+          if (typeof hot.hasHot === 'boolean') {
+            renderListingState(topBtn, hot.hasHot, 'Top posts', 'No top', hot.hotError);
+          }
         }
       },
       () => wrap.isConnected && wrap.dataset.author === author && wrap.dataset.nearby === 'true',
@@ -1203,6 +1194,7 @@ async function updateAuthorStatus(wrap, canRetry = true, priority = false) {
       cancelled = true;
       if (typeof status.hasHot === 'boolean' && wrap.isConnected && wrap.dataset.author === author) {
         renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.hotError || '');
+        renderListingState(topBtn, status.hasHot, 'Top posts', 'No top', status.hotError || '');
       }
       return;
     }
