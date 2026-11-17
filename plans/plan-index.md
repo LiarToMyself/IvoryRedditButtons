@@ -6,5 +6,6 @@
 - [CHANGES-1.4.2-argon.md](CHANGES-1.4.2-argon.md) - IvoryRedditButtons 1.4.2 (Argon) diagnosis and changes
 - [CHANGES-v1.4.3-gemini-ai-studio-argon.md](CHANGES-v1.4.3-gemini-ai-studio-argon.md) - IvoryRedditButtons 1.4.3 changes
 - [CHANGES-v1.4.3-gemini-ai-studio-argon-BUGFIXES2.md](CHANGES-v1.4.3-gemini-ai-studio-argon-BUGFIXES2.md) - IvoryRedditButtons 1.4.3 bugfixes 2 (429 rate limit & red buttons fix)
+- [2026-11-17-comparison-BUGFIXES1-vs-BUGFIXES2.md](2026-11-17-comparison-BUGFIXES1-vs-BUGFIXES2.md) - Comparative audit of BUGFIXES1 vs BUGFIXES2
 - [REVIEW-2026-10-22.md](REVIEW-2026-10-22.md) - Audit and verdict from 2026-10-22
 - [code-micro-reports/index.md](code-micro-reports/index.md) - Index of code micro-reports
