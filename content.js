@@ -25,7 +25,7 @@ const blockedAuthors = new Set(), pendingBlocks = new Set(), authorErrors = new 
 const dwellTimers = new WeakMap(), hoverTimers = new WeakMap(), postToWrap = new WeakMap(), dimmedPosts = new WeakMap();
 const fetchQueue = [];
 let activeReqs = 0, reservingSlot = false, queueTimer = null, persistTimer = null;
-let cachedModhash = '', modhashPromise = null, blockChain = Promise.resolve(), nextBlockAt = 0, seqCounter = 0, adaptiveScale = 1;
+let cachedModhash = '', modhashPromise = null, blockChain = Promise.resolve(), nextBlockAt = 0, seqCounter = 0;
 
 initStorage();
 
@@ -54,6 +54,7 @@ function readQuotaState(now = Date.now()) {
     quotaPausedUntil: Number(d.quotaPausedUntil) || 0,
     nextRequestAt: Number(d.nextRequestAt) || 0,
     lastRequestAt: Number(d.lastRequestAt) || 0,
+    adaptiveScale: Number(d.adaptiveScale) >= 2 ? 2 : 1,
     recentTimestamps,
   };
 }
@@ -118,9 +119,9 @@ function parseHeaderNum(raw, mode = 'min') {
 
 async function reserveSlot(isPriority) {
   return withQuotaLock(() => {
-    const now = Date.now(), st = readQuotaState(now);
+    const now = Date.now(), st = readQuotaState(now), scale = st.adaptiveScale;
     const inShort = st.recentTimestamps.filter((t) => t > now - WIN_SHORT_MS);
-    const hoverFloor = st.lastRequestAt ? st.lastRequestAt + HOVER_GAP_MS * adaptiveScale : 0;
+    const hoverFloor = st.lastRequestAt ? st.lastRequestAt + HOVER_GAP_MS * scale : 0;
     let blockedUntil = Math.max(st.rateLimitedUntil, isPriority ? 0 : st.quotaPausedUntil, isPriority ? hoverFloor : st.nextRequestAt);
     const maxMin = isPriority ? TOT_MAX_MIN : BG_MAX_MIN, max10m = isPriority ? TOT_MAX_10M : BG_MAX_10M;
     if (inShort.length >= maxMin) blockedUntil = Math.max(blockedUntil, inShort[inShort.length - maxMin] + WIN_SHORT_MS + 50);
@@ -129,10 +130,20 @@ async function reserveSlot(isPriority) {
 
     st.recentTimestamps.push(now);
     st.lastRequestAt = now;
-    const bgStep = inShort.length < 2 ? 2600 : inShort.length < 4 ? 6500 : 11000;
-    st.nextRequestAt = isPriority ? Math.max(st.nextRequestAt, now + HOVER_GAP_MS * adaptiveScale) : now + bgStep * adaptiveScale + Math.floor(Math.random() * 400);
+    const bgStep = st.recentTimestamps.length < 12 ? 11_000 : st.recentTimestamps.length < 20 ? 15_000 : 22_000;
+    const fastStart = inShort.length < 2 && st.recentTimestamps.length < 6 ? 2600 : bgStep;
+    st.nextRequestAt = isPriority ? Math.max(st.nextRequestAt, now + HOVER_GAP_MS * scale) : now + fastStart * scale + Math.floor(Math.random() * 400);
     writeJson(QUOTA_KEY, st);
     return { allowed: true, waitMs: 0 };
+  });
+}
+
+async function recordExternalCall() {
+  return withQuotaLock(() => {
+    const now = Date.now(), st = readQuotaState(now);
+    st.recentTimestamps.push(now);
+    st.lastRequestAt = now;
+    writeJson(QUOTA_KEY, st);
   });
 }
 
@@ -144,7 +155,7 @@ async function recordResponseHeaders(res, bodyText = '') {
   await withQuotaLock(() => {
     const st = readQuotaState(now);
     if (is429) {
-      adaptiveScale = 2;
+      st.adaptiveScale = 2;
       const hSec = parseHeaderNum(res.headers.get('Retry-After'), 'max');
       const secM = bodyText.match(/(\d+(?:\.\d+)?)\s*seconds?/i), minM = bodyText.match(/(\d+(?:\.\d+)?)\s*minutes?/i);
       const bMs = secM ? Number(secM[1]) * 1000 : minM ? Number(minM[1]) * 60_000 : 0;
@@ -157,8 +168,9 @@ async function recordResponseHeaders(res, bodyText = '') {
   });
 }
 
-async function fetchJsonDirect(url, options = {}) {
+async function fetchJsonDirect(url, options = {}, trackExternal = false) {
   if (readQuotaState().rateLimitedUntil > Date.now()) throw new RequestError('Rate limited', { status: 429, retryable: true });
+  if (trackExternal) await recordExternalCall();
   const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT_MS);
   try {
     const res = await fetch(url, { ...options, credentials: 'same-origin', headers: { Accept: 'application/json', ...options.headers }, signal: ctrl.signal });
@@ -317,7 +329,7 @@ async function blockAccountRequest(author, authorId) {
   const cookieM = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/), app = document.querySelector('shreddit-app');
   const csrf = (cookieM ? decodeURIComponent(cookieM[1]) : '') || app?.csrfToken || app?.getAttribute('csrf-token') || '';
   let uh = document.querySelector('input[name="uh"]')?.value || cachedModhash;
-  if (!uh && !modhashPromise) modhashPromise = fetchJsonDirect(`${location.origin}/api/me.json`).then((d) => (cachedModhash = d?.data?.modhash || '')).catch(() => '').finally(() => { modhashPromise = null; });
+  if (!uh && !modhashPromise) modhashPromise = fetchJsonDirect(`${location.origin}/api/me.json`, {}, true).then((d) => (cachedModhash = d?.data?.modhash || '')).catch(() => '').finally(() => { modhashPromise = null; });
   if (!uh && modhashPromise) uh = await modhashPromise;
   if (!uh && !csrf) throw new RequestError('Not signed in');
 
@@ -326,12 +338,12 @@ async function blockAccountRequest(author, authorId) {
     if (uh) p.set('uh', uh); if (accId) p.set('account_id', accId);
     const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
     if (uh) headers['X-Modhash'] = uh; if (csrf) headers['X-CSRF-Token'] = csrf;
-    await fetchJsonDirect(`${location.origin}/api/block_user`, { method: 'POST', headers, body: p.toString() });
+    await fetchJsonDirect(`${location.origin}/api/block_user`, { method: 'POST', headers, body: p.toString() }, true);
   };
   const validId = /^t2_[a-z0-9]+$/i.test(authorId || '') ? authorId : '';
   try { await sendPost(validId); } catch (err) {
     if (err.status === 429 || validId) throw err;
-    const prof = await fetchJsonDirect(`${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`).catch(() => null);
+    const prof = await fetchJsonDirect(`${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`, {}, true).catch(() => null);
     if (!prof?.data?.id) throw err;
     await sendPost(`t2_${prof.data.id}`);
   }
