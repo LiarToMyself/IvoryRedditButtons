@@ -1,17 +1,22 @@
 const WRAP_CLASS = 'author-btns-wrap';
 const POST_SELECTOR = 'shreddit-post, .thing.link';
-const BLOCKED_STORAGE_KEY = 'ivory_reddit_blocked_v1';
-const STATUS_STORAGE_KEY = 'ivory_reddit_author_status_v4';
-const RATELIMIT_STORAGE_KEY = 'ivory_reddit_ratelimit_v4';
-const LEGACY_STORAGE_KEYS = [
-  'ivory_reddit_author_status_v1',
-  'ivory_reddit_author_status_v2',
-  'ivory_reddit_author_status_v3',
+const BLOCKED_KEY = 'ivory_reddit_blocked_v1';
+const STATUS_KEY = 'ivory_reddit_author_status_v5';
+const QUOTA_KEY = 'ivory_reddit_ratelimit_v5';
+const OLD_QUOTA_KEYS = [
   'ivory_reddit_ratelimit_v1',
   'ivory_reddit_ratelimit_v2',
   'ivory_reddit_ratelimit_v3',
+  'ivory_reddit_ratelimit_v4',
+];
+const OLD_STATUS_KEYS = [
+  'ivory_reddit_author_status_v1',
+  'ivory_reddit_author_status_v2',
+  'ivory_reddit_author_status_v3',
+  'ivory_reddit_author_status_v4',
   'ivory_reddit_last_req_v1',
 ];
+const SKIP_AUTHORS = new Set(['automoderator', '[deleted]', '[removed]', 'reddit']);
 
 const BASE_BTN_STYLE =
   'position:relative;z-index:10;pointer-events:auto;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;height:26px;min-height:26px;max-height:26px;min-width:0;appearance:none;vertical-align:middle;gap:5px;margin:0;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:16px;text-decoration:none;white-space:nowrap;cursor:pointer;user-select:none;font-family:inherit;flex-shrink:0;transition:background 0.15s,border-color 0.15s,color 0.15s,opacity 0.15s;';
@@ -22,399 +27,310 @@ const BLOCKED_THEME = { bg: '#1b2e22', bgHover: '#1b2e22', color: '#82e0aa', bor
 const BADGE_STYLE =
   'display:inline-block;padding:1px 5px;background:#6e2c33;color:#ffd7d5;border-radius:999px;font-size:10px;font-weight:700;line-height:13px;';
 
-const REQUEST_TIMEOUT_MS = 15000;
-const REQUEST_INTERVAL_MS = 2400;
-const VIEWPORT_DWELL_MS = 900;
-const HOVER_DEBOUNCE_MS = 180;
-const PREFETCH_MARGIN_PX = 200;
-const STATUS_TTL_MS = 2 * 60 * 60 * 1000;
-const FAILURE_TTL_MS = 60 * 1000;
-const RATE_LIMIT_FALLBACK_MS = 10 * 60 * 1000;
-const MAX_CACHE_SIZE = 1000;
+const WIN_SHORT_MS = 60_000;
+const WIN_LONG_MS = 600_000;
+const RATE_FLOOR_MS = 600_000;
+const BG_MAX_MIN = 5;
+const TOT_MAX_MIN = 7;
+const BG_MAX_10M = 24;
+const TOT_MAX_10M = 30;
+const DWELL_MS = 850;
+const HOVER_MS = 120;
+const HOVER_GAP_MS = 1800;
+const REQ_TIMEOUT_MS = 12_000;
+const TTL_OK_MS = 86_400_000;
+const TTL_EMPTY_MS = 14_400_000;
+const FAIL_TTL_MS = 60_000;
 const BLOCK_COOLDOWN_MS = 1500;
 const ERROR_LOCK_MS = 2000;
-const RATELIMIT_RESERVE = 20;
-const WINDOW_SHORT_MS = 60 * 1000;
-const MAX_PER_MIN = 7;
-const WINDOW_LONG_MS = 10 * 60 * 1000;
-const MAX_PER_10MIN = 28;
 
 const authorCache = new Map();
-const inFlightChecks = new Map();
-const retryAfterMap = new Map();
+const inFlight = new Map();
+const retryAfter = new Map();
+const partialTopEmpty = new Map();
+const partialHotOk = new Map();
 const blockedAuthors = new Set();
 const pendingBlocks = new Set();
 const authorErrors = new Map();
 const dwellTimers = new WeakMap();
 const hoverTimers = new WeakMap();
-const postToWrapMap = new WeakMap();
+const postToWrap = new WeakMap();
 const dimmedPosts = new WeakMap();
 const fetchQueue = [];
 
-let activeRequests = 0;
-let nextRequestAt = 0;
-let rateLimitedUntil = 0;
-let quotaPausedUntil = 0;
-let recentTimestamps = [];
-let nextBlockAllowedAt = 0;
+let activeReqs = 0;
+let reservingSlot = false;
 let queueTimer = null;
+let persistTimer = null;
 let cachedModhash = '';
 let modhashPromise = null;
 let blockChain = Promise.resolve();
+let nextBlockAt = 0;
 let seqCounter = 0;
+let adaptiveScale = 1;
 
 initStorage();
 
-function readStorage(key) {
+function readJson(key) {
   try {
-    const val = typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
-    if (val) return val;
-  } catch {}
-  try {
-    return typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(key) : null;
+    const raw = localStorage.getItem(key) || sessionStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
   } catch {
     return null;
   }
 }
 
-function writeStorage(key, val) {
-  try {
-    if (typeof localStorage !== 'undefined') localStorage.setItem(key, val);
-  } catch {}
-  try {
-    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(key, val);
-  } catch {}
+function writeJson(key, val) {
+  const str = JSON.stringify(val);
+  try { localStorage.setItem(key, str); } catch {}
+  try { sessionStorage.setItem(key, str); } catch {}
 }
 
-function saveBlockedAuthors() {
-  writeStorage(BLOCKED_STORAGE_KEY, JSON.stringify([...blockedAuthors]));
+function withQuotaLock(fn) {
+  return navigator.locks?.request
+    ? navigator.locks.request('ivory_reddit_quota_v5', fn)
+    : Promise.resolve().then(fn);
+}
+
+function readQuotaState(now = Date.now()) {
+  const d = readJson(QUOTA_KEY) || {};
+  const recentTimestamps = (Array.isArray(d.recentTimestamps) ? d.recentTimestamps : [])
+    .filter((t) => typeof t === 'number' && Number.isFinite(t) && t > now - WIN_LONG_MS)
+    .sort((a, b) => a - b)
+    .slice(-TOT_MAX_10M);
+  return {
+    rateLimitedUntil: Number(d.rateLimitedUntil) || 0,
+    quotaPausedUntil: Number(d.quotaPausedUntil) || 0,
+    nextRequestAt: Number(d.nextRequestAt) || 0,
+    lastRequestAt: Number(d.lastRequestAt) || 0,
+    recentTimestamps,
+  };
 }
 
 function initStorage() {
-  for (const key of LEGACY_STORAGE_KEYS) {
-    try {
-      if (typeof localStorage !== 'undefined') localStorage.removeItem(key);
-      if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(key);
-    } catch {}
-  }
-  try {
-    const rawBlocked = readStorage(BLOCKED_STORAGE_KEY);
-    if (rawBlocked) {
-      JSON.parse(rawBlocked).forEach((a) => blockedAuthors.add(String(a).toLowerCase()));
+  const now = Date.now();
+  const cur = readQuotaState(now);
+  let migrated = false;
+  for (const k of OLD_QUOTA_KEYS) {
+    const old = readJson(k);
+    if (old && typeof old === 'object') {
+      if (Number(old.rateLimitedUntil) > cur.rateLimitedUntil) cur.rateLimitedUntil = Number(old.rateLimitedUntil);
+      const ts = old.recentTimestamps || old.recentBgTimestamps;
+      if (Array.isArray(ts)) {
+        cur.recentTimestamps = [...new Set([...cur.recentTimestamps, ...ts])]
+          .filter((t) => typeof t === 'number' && t > now - WIN_LONG_MS)
+          .sort((a, b) => a - b)
+          .slice(-TOT_MAX_10M);
+      }
+      migrated = true;
     }
-  } catch {}
-  hydrateRateLimit();
+    try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch {}
+  }
+  if (migrated) writeJson(QUOTA_KEY, cur);
+  for (const k of OLD_STATUS_KEYS) {
+    try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch {}
+  }
+  const blk = readJson(BLOCKED_KEY);
+  if (Array.isArray(blk)) blk.forEach((a) => blockedAuthors.add(String(a).toLowerCase()));
   hydrateAuthorCache();
 }
 
-function pruneTimestamps(list, now = Date.now()) {
-  if (!Array.isArray(list)) return [];
-  return list
-    .filter((t) => typeof t === 'number' && Number.isFinite(t) && t > now - WINDOW_LONG_MS)
-    .sort((a, b) => a - b)
-    .slice(-MAX_PER_10MIN);
-}
-
-function hydrateRateLimit() {
-  try {
-    const raw = readStorage(RATELIMIT_STORAGE_KEY);
-    if (!raw) return;
-    const data = JSON.parse(raw);
-    const now = Date.now();
-    if (typeof data.rateLimitedUntil === 'number' && data.rateLimitedUntil > now) {
-      rateLimitedUntil = Math.max(rateLimitedUntil, data.rateLimitedUntil);
-    }
-    if (typeof data.nextRequestAt === 'number' && data.nextRequestAt > now) {
-      nextRequestAt = Math.max(nextRequestAt, data.nextRequestAt);
-    }
-    if (Array.isArray(data.recentTimestamps)) {
-      const merged = [...new Set([...recentTimestamps, ...data.recentTimestamps])];
-      recentTimestamps = pruneTimestamps(merged, now);
-    }
-  } catch {}
-}
-
-function persistRateLimit() {
-  const now = Date.now();
-  recentTimestamps = pruneTimestamps(recentTimestamps, now);
-  writeStorage(
-    RATELIMIT_STORAGE_KEY,
-    JSON.stringify({ rateLimitedUntil, nextRequestAt, recentTimestamps })
-  );
-}
-
 function hydrateAuthorCache() {
-  try {
-    const raw = readStorage(STATUS_STORAGE_KEY);
-    if (!raw) return;
-    const data = JSON.parse(raw);
-    const now = Date.now();
-    for (const [k, v] of Object.entries(data)) {
-      if (v && v.expiresAt > now && typeof v.hasHot === 'boolean' && typeof v.hasTop === 'boolean') {
-        authorCache.set(k.toLowerCase(), {
-          hasHot: v.hasHot,
-          hasTop: v.hasTop,
-          expiresAt: v.expiresAt,
-        });
-      }
+  const data = readJson(STATUS_KEY);
+  if (!data || typeof data !== 'object') return;
+  const now = Date.now();
+  for (const [k, v] of Object.entries(data)) {
+    if (v && v.expiresAt > now && typeof v.hasHot === 'boolean' && typeof v.hasTop === 'boolean') {
+      authorCache.set(k.toLowerCase(), { hasHot: v.hasHot, hasTop: v.hasTop, expiresAt: v.expiresAt });
     }
-  } catch {}
+  }
 }
 
-function persistAuthorCache() {
+function persistAuthorCacheNow() {
+  if (persistTimer !== null) { clearTimeout(persistTimer); persistTimer = null; }
+  hydrateAuthorCache();
   const now = Date.now();
   const out = {};
   for (const [k, v] of authorCache.entries()) {
-    if (v.expiresAt <= now) {
-      authorCache.delete(k);
-    } else if (typeof v.hasHot === 'boolean' && typeof v.hasTop === 'boolean') {
-      if (authorCache.size > MAX_CACHE_SIZE) {
-        authorCache.delete(k);
-        continue;
-      }
+    if (v.expiresAt <= now) authorCache.delete(k);
+    else if (typeof v.hasHot === 'boolean' && typeof v.hasTop === 'boolean') {
       out[k] = { hasHot: v.hasHot, hasTop: v.hasTop, expiresAt: v.expiresAt };
     }
   }
-  writeStorage(STATUS_STORAGE_KEY, JSON.stringify(out));
+  writeJson(STATUS_KEY, out);
+}
+
+function schedulePersistCache() {
+  if (persistTimer === null) persistTimer = setTimeout(persistAuthorCacheNow, 500);
 }
 
 class RequestError extends Error {
-  constructor(message, { status = 0, retryable = false, uncertain = false } = {}) {
+  constructor(message, { status = 0, retryable = false } = {}) {
     super(message);
     this.status = status;
     this.retryable = retryable;
-    this.uncertain = uncertain;
   }
 }
 
-function parseHeaderNumber(raw, mode = 'min') {
+function parseHeaderNum(raw, mode = 'min') {
   if (raw === null || raw === undefined) return NaN;
-  const nums = String(raw)
-    .split(',')
-    .map((s) => parseFloat(s.trim()))
-    .filter((n) => Number.isFinite(n));
-  if (!nums.length) return NaN;
-  return mode === 'max' ? Math.max(...nums) : Math.min(...nums);
+  const nums = String(raw).split(',').map((s) => parseFloat(s.trim())).filter(Number.isFinite);
+  return nums.length ? (mode === 'max' ? Math.max(...nums) : Math.min(...nums)) : NaN;
 }
 
-function getBudgetBlockedUntil(now = Date.now()) {
-  recentTimestamps = pruneTimestamps(recentTimestamps, now);
-  let blockedUntil = Math.max(nextRequestAt, rateLimitedUntil, quotaPausedUntil);
-  const shortCut = now - WINDOW_SHORT_MS;
-  const inShort = recentTimestamps.filter((t) => t > shortCut);
-  if (inShort.length >= MAX_PER_MIN) {
-    blockedUntil = Math.max(
-      blockedUntil,
-      inShort[inShort.length - MAX_PER_MIN] + WINDOW_SHORT_MS + 50
+async function reserveSlot(isPriority) {
+  return withQuotaLock(() => {
+    const now = Date.now();
+    const st = readQuotaState(now);
+    const inShort = st.recentTimestamps.filter((t) => t > now - WIN_SHORT_MS);
+    const hoverFloor = st.lastRequestAt ? st.lastRequestAt + HOVER_GAP_MS * adaptiveScale : 0;
+    let blockedUntil = Math.max(
+      st.rateLimitedUntil,
+      isPriority ? 0 : st.quotaPausedUntil,
+      isPriority ? hoverFloor : st.nextRequestAt
     );
-  }
-  if (recentTimestamps.length >= MAX_PER_10MIN) {
-    blockedUntil = Math.max(
-      blockedUntil,
-      recentTimestamps[recentTimestamps.length - MAX_PER_10MIN] + WINDOW_LONG_MS + 50
-    );
-  }
-  return blockedUntil;
+    const maxMin = isPriority ? TOT_MAX_MIN : BG_MAX_MIN;
+    const max10m = isPriority ? TOT_MAX_10M : BG_MAX_10M;
+    if (inShort.length >= maxMin) {
+      blockedUntil = Math.max(blockedUntil, inShort[inShort.length - maxMin] + WIN_SHORT_MS + 50);
+    }
+    if (st.recentTimestamps.length >= max10m) {
+      blockedUntil = Math.max(blockedUntil, st.recentTimestamps[st.recentTimestamps.length - max10m] + WIN_LONG_MS + 50);
+    }
+    if (blockedUntil > now) return { allowed: false, waitMs: blockedUntil - now };
+
+    st.recentTimestamps.push(now);
+    st.lastRequestAt = now;
+    const bgStep = inShort.length < 2 ? 2600 : inShort.length < 4 ? 6500 : 11000;
+    st.nextRequestAt = isPriority
+      ? Math.max(st.nextRequestAt, now + HOVER_GAP_MS * adaptiveScale)
+      : now + bgStep * adaptiveScale + Math.floor(Math.random() * 400);
+    writeJson(QUOTA_KEY, st);
+    return { allowed: true, waitMs: 0 };
+  });
 }
 
-function respectRateLimit(res, bodyText = '') {
+async function recordResponseHeaders(res, bodyText = '') {
   const now = Date.now();
-  if (res.status === 429) {
-    const headerSec = parseHeaderNumber(res.headers.get('Retry-After'), 'max');
-    const secMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*seconds?/i);
-    const minMatch = bodyText.match(/(\d+(?:\.\d+)?)\s*minutes?/i);
-    const bodyMs = secMatch
-      ? Number(secMatch[1]) * 1000
-      : minMatch
-        ? Number(minMatch[1]) * 60000
-        : 0;
-    const waitMs =
-      Number.isFinite(headerSec) && headerSec > 0
-        ? headerSec * 1000
-        : bodyMs > 0
-          ? bodyMs
-          : RATE_LIMIT_FALLBACK_MS;
-    rateLimitedUntil = Math.max(rateLimitedUntil, now + waitMs);
-  }
-  const rem = parseHeaderNumber(res.headers.get('X-Ratelimit-Remaining'), 'min');
-  const reset = parseHeaderNumber(res.headers.get('X-Ratelimit-Reset'), 'max');
-  if (Number.isFinite(rem) && rem <= RATELIMIT_RESERVE) {
-    const pauseMs = Number.isFinite(reset) && reset > 0 ? Math.min(reset, 60) * 1000 : 30000;
-    quotaPausedUntil = Math.max(quotaPausedUntil, now + pauseMs);
-  }
-  persistRateLimit();
-}
-
-function isAllowedListingRedirect(origUrl, finalUrl) {
-  try {
-    const o = new URL(origUrl, location.origin);
-    const d = new URL(finalUrl, location.origin);
-    return (
-      o.origin === d.origin &&
-      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(o.pathname) &&
-      /^\/(?:user|u)\/[^/]+\/submitted\.json$/i.test(d.pathname)
-    );
-  } catch {
-    return false;
-  }
+  const is429 = res.status === 429;
+  const rem = parseHeaderNum(res.headers.get('X-Ratelimit-Remaining'), 'min');
+  const reset = parseHeaderNum(res.headers.get('X-Ratelimit-Reset'), 'max');
+  if (!is429 && !(Number.isFinite(rem) && rem <= 20)) return;
+  await withQuotaLock(() => {
+    const st = readQuotaState(now);
+    if (is429) {
+      adaptiveScale = 2;
+      const hSec = parseHeaderNum(res.headers.get('Retry-After'), 'max');
+      const secM = bodyText.match(/(\d+(?:\.\d+)?)\s*seconds?/i);
+      const minM = bodyText.match(/(\d+(?:\.\d+)?)\s*minutes?/i);
+      const bMs = secM ? Number(secM[1]) * 1000 : minM ? Number(minM[1]) * 60_000 : 0;
+      const waitMs = Math.max(Number.isFinite(hSec) ? hSec * 1000 : 0, bMs, RATE_FLOOR_MS);
+      st.rateLimitedUntil = Math.max(st.rateLimitedUntil, now + waitMs);
+    }
+    if (Number.isFinite(rem) && rem <= 20) {
+      const pauseSec = Number.isFinite(reset) && reset > 0 ? Math.min(reset, 300) : 60;
+      st.quotaPausedUntil = Math.max(st.quotaPausedUntil, now + pauseSec * 1000);
+    }
+    writeJson(QUOTA_KEY, st);
+  });
 }
 
 async function fetchJsonDirect(url, options = {}) {
-  hydrateRateLimit();
-  if (rateLimitedUntil > Date.now()) {
-    const waitSec = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
-    throw new RequestError(`Reddit rate limit active (${waitSec}s).`, {
-      status: 429,
-      retryable: true,
-    });
+  const st = readQuotaState();
+  if (st.rateLimitedUntil > Date.now()) {
+    throw new RequestError('Rate limited', { status: 429, retryable: true });
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
       ...options,
       credentials: 'same-origin',
       headers: { Accept: 'application/json', ...options.headers },
-      signal: controller.signal,
+      signal: ctrl.signal,
     });
     const text = await res.text().catch(() => '');
-    respectRateLimit(res, res.status === 429 ? text : '');
-    if (!res.ok) {
-      throw new RequestError(`Reddit HTTP ${res.status}`, {
-        status: res.status,
-        retryable: res.status === 429 || res.status >= 500,
-        uncertain: res.status >= 500,
-      });
-    }
-    if (res.redirected && !isAllowedListingRedirect(url, res.url)) {
-      throw new RequestError('Unexpected redirect.', { retryable: true, uncertain: true });
-    }
+    await recordResponseHeaders(res, res.status === 429 ? text : '');
+    if (!res.ok) throw new RequestError(`HTTP ${res.status}`, { status: res.status, retryable: res.status === 429 || res.status >= 500 });
     if (options.method === 'POST' && (res.status === 204 || !text.trim())) return {};
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new RequestError('Unreadable response from Reddit.', { retryable: true, uncertain: true });
-    }
-    const errors = data?.json?.errors ?? data?.errors;
-    if (Array.isArray(errors) && errors.length) {
-      const limited = errors.some((e) => Array.isArray(e) && e[0] === 'RATELIMIT');
-      if (limited) {
-        rateLimitedUntil = Math.max(rateLimitedUntil, Date.now() + RATE_LIMIT_FALLBACK_MS);
-        persistRateLimit();
-      }
-      throw new RequestError(
-        errors.map((e) => (Array.isArray(e) ? e.slice(0, 2).join(': ') : String(e))).join('; '),
-        { status: limited ? 429 : 0, retryable: limited }
-      );
-    }
-    if (data?.error || data?.success === false) {
-      throw new RequestError(String(data.message || data.error || 'Request rejected.'));
+    const data = JSON.parse(text);
+    const errs = data?.json?.errors ?? data?.errors;
+    if (Array.isArray(errs) && errs.length) {
+      const lim = errs.some((e) => Array.isArray(e) && e[0] === 'RATELIMIT');
+      if (lim) await recordResponseHeaders({ status: 429, headers: new Headers() }, text);
+      throw new RequestError('Reddit API error', { status: lim ? 429 : 0, retryable: lim });
     }
     return data;
-  } catch (err) {
-    if (err instanceof RequestError) throw err;
-    throw new RequestError(
-      controller.signal.aborted ? 'Request timed out.' : 'Network error.',
-      { retryable: true, uncertain: true }
-    );
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timer);
   }
 }
 
-function enqueueListingRequest(task, authorKey, priority = false) {
-  return new Promise((resolve, reject) => {
-    fetchQueue.push({
-      task,
-      resolve,
-      reject,
-      authorKey,
-      priority: Boolean(priority),
-      seq: ++seqCounter,
-    });
-    processQueue();
-  });
-}
-
-function isAuthorVisibleInDom(authorKey) {
-  const wraps = document.querySelectorAll(`.${WRAP_CLASS}`);
-  for (const w of wraps) {
-    if ((w.dataset.author || '').toLowerCase() === authorKey && w.dataset.nearby === 'true') {
-      return true;
-    }
+function isAuthorVisible(authorKey) {
+  for (const w of document.querySelectorAll(`.${WRAP_CLASS}`)) {
+    if ((w.dataset.author || '').toLowerCase() === authorKey && w.dataset.nearby === 'true') return true;
   }
   return false;
 }
 
-function processQueue() {
-  if (queueTimer !== null) {
-    clearTimeout(queueTimer);
-    queueTimer = null;
-  }
-  if (document.visibilityState === 'hidden' || pendingBlocks.size > 0) return;
-  if (activeRequests >= 1 || fetchQueue.length === 0) return;
+async function processQueue() {
+  if (queueTimer !== null) { clearTimeout(queueTimer); queueTimer = null; }
+  if (document.visibilityState === 'hidden' || pendingBlocks.size > 0 || activeReqs >= 1 || reservingSlot) return;
 
   for (let i = fetchQueue.length - 1; i >= 0; i--) {
-    const item = fetchQueue[i];
-    if (blockedAuthors.has(item.authorKey) || (!item.priority && !isAuthorVisibleInDom(item.authorKey))) {
+    const it = fetchQueue[i];
+    if (blockedAuthors.has(it.authorKey) || (!it.priority && !isAuthorVisible(it.authorKey))) {
       fetchQueue.splice(i, 1);
-      item.resolve(null);
+      it.resolve(null);
     }
   }
-  if (fetchQueue.length === 0) return;
-
-  hydrateRateLimit();
-  const now = Date.now();
-  const blockedUntil = getBudgetBlockedUntil(now);
-  if (blockedUntil > now) {
-    queueTimer = setTimeout(processQueue, Math.min(blockedUntil - now + 25, 60000));
-    return;
-  }
+  if (!fetchQueue.length) return;
 
   let bestIdx = 0;
-  let bestScore = -Infinity;
-  for (let i = 0; i < fetchQueue.length; i++) {
-    const score = (fetchQueue[i].priority ? 1e9 : 0) + fetchQueue[i].seq;
-    if (score > bestScore) {
-      bestScore = score;
-      bestIdx = i;
-    }
+  for (let i = 1; i < fetchQueue.length; i++) {
+    const sA = (fetchQueue[i].priority ? 1e9 : 0) + fetchQueue[i].seq;
+    const sB = (fetchQueue[bestIdx].priority ? 1e9 : 0) + fetchQueue[bestIdx].seq;
+    if (sA > sB) bestIdx = i;
   }
 
-  const [entry] = fetchQueue.splice(bestIdx, 1);
-  activeRequests++;
-  const startedAt = Date.now();
-  recentTimestamps.push(startedAt);
-  nextRequestAt = startedAt + REQUEST_INTERVAL_MS;
-  persistRateLimit();
+  reservingSlot = true;
+  let slot;
+  try {
+    slot = await reserveSlot(fetchQueue[bestIdx].priority);
+  } finally {
+    reservingSlot = false;
+  }
+  if (!slot.allowed) {
+    queueTimer = setTimeout(processQueue, Math.min(slot.waitMs + 30, 60_000));
+    return;
+  }
+  if (!fetchQueue.length || activeReqs >= 1) return;
 
+  const [entry] = fetchQueue.splice(bestIdx, 1);
+  activeReqs++;
   Promise.resolve()
     .then(entry.task)
     .then(entry.resolve, entry.reject)
     .finally(() => {
-      activeRequests--;
+      activeReqs--;
       processQueue();
     });
 }
 
-function isVisibleSubmissionItem(child) {
+function isVisiblePost(child) {
   const d = child?.data;
-  if (!d || typeof d !== 'object') return false;
-  if (child.kind && child.kind !== 't3') return false;
-  if (d.removed_by_category || d.removed === true || d.spam === true || d.hidden === true) return false;
-  if (d.author === '[deleted]') return false;
-  return true;
+  return Boolean(d && (!child.kind || child.kind === 't3') && !d.removed_by_category && !d.removed && !d.spam && !d.hidden && d.author !== '[deleted]');
 }
 
-async function fetchListingBool(url, authorKey, priority) {
-  const data = await enqueueListingRequest(() => fetchJsonDirect(url), authorKey, priority);
+async function fetchListing(url, authorKey, priority) {
+  const data = await new Promise((resolve, reject) => {
+    fetchQueue.push({ task: () => fetchJsonDirect(url), resolve, reject, authorKey, priority: Boolean(priority), seq: ++seqCounter });
+    processQueue();
+  });
   if (data === null) return null;
   const children = data?.data?.children;
-  if (data?.kind !== 'Listing' || !Array.isArray(children)) {
-    throw new RequestError('Invalid listing response', { retryable: true });
-  }
-  return children.some(isVisibleSubmissionItem);
+  if (data?.kind !== 'Listing' || !Array.isArray(children)) throw new RequestError('Invalid listing', { retryable: true });
+  return children.some(isVisiblePost);
 }
 
 function applyTheme(btn, theme) {
@@ -425,37 +341,18 @@ function applyTheme(btn, theme) {
   btn.style.border = `1px solid ${theme.border}`;
 }
 
-function bindHoverAndStopPropagation(btn) {
-  btn.addEventListener('mouseenter', () => {
-    if (!btn.disabled) btn.style.background = btn.dataset.bgHover;
-  });
-  btn.addEventListener('mouseleave', () => {
-    btn.style.background = btn.dataset.bg;
-  });
-  ['pointerdown', 'mousedown', 'mouseup'].forEach((evt) => {
-    btn.addEventListener(evt, (e) => e.stopPropagation());
-  });
-}
-
-function setEmptyState(btn, emptyText) {
-  btn.dataset.postsState = 'empty';
-  applyTheme(btn, EMPTY_THEME);
-  btn.textContent = '';
-  const badge = document.createElement('span');
-  badge.style.cssText = BADGE_STYLE;
-  badge.textContent = '✕';
-  const label = document.createElement('span');
-  label.textContent = emptyText;
-  btn.appendChild(badge);
-  btn.appendChild(label);
-}
-
-function renderListingState(btn, hasPosts, label, emptyLabel, error = '') {
+function renderListingBtn(btn, hasPosts, label, emptyLabel) {
   if (!btn) return;
   btn.dataset.postsState = hasPosts === null ? 'unknown' : hasPosts ? 'present' : 'empty';
-  btn.title = hasPosts === null && error ? `Could not check posts: ${error}` : '';
   if (hasPosts === false) {
-    setEmptyState(btn, emptyLabel);
+    applyTheme(btn, EMPTY_THEME);
+    btn.textContent = '';
+    const b = document.createElement('span');
+    b.style.cssText = BADGE_STYLE;
+    b.textContent = '✕';
+    const l = document.createElement('span');
+    l.textContent = emptyLabel;
+    btn.append(b, l);
   } else {
     applyTheme(btn, NORMAL_THEME);
     btn.textContent = label;
@@ -463,93 +360,82 @@ function renderListingState(btn, hasPosts, label, emptyLabel, error = '') {
 }
 
 function syncAuthorButtons(author, status) {
-  if (!author || !status) return;
   const key = author.toLowerCase();
-  document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
-    if ((wrap.dataset.author || '').toLowerCase() !== key) return;
-    const postsBtn = wrap.querySelector('[data-role="posts"]');
-    const topBtn = wrap.querySelector('[data-role="top"]');
-    if ('hasHot' in status && status.hasHot !== undefined) {
-      renderListingState(postsBtn, status.hasHot, 'Posts', 'No posts', status.error || '');
-    }
-    if ('hasTop' in status && status.hasTop !== undefined) {
-      renderListingState(topBtn, status.hasTop, 'Top posts', 'No top', status.error || '');
-    }
+  document.querySelectorAll(`.${WRAP_CLASS}`).forEach((w) => {
+    if ((w.dataset.author || '').toLowerCase() !== key) return;
+    if ('hasHot' in status && status.hasHot !== undefined) renderListingBtn(w.querySelector('[data-role="posts"]'), status.hasHot, 'Posts', 'No posts');
+    if ('hasTop' in status && status.hasTop !== undefined) renderListingBtn(w.querySelector('[data-role="top"]'), status.hasTop, 'Top posts', 'No top');
   });
+}
+
+function saveSettled(author, hasHot, hasTop) {
+  const key = author.toLowerCase();
+  const ttl = hasHot && hasTop ? TTL_OK_MS : TTL_EMPTY_MS;
+  const rec = { hasHot: Boolean(hasHot), hasTop: Boolean(hasTop), expiresAt: Date.now() + ttl };
+  authorCache.set(key, rec);
+  partialTopEmpty.delete(key);
+  partialHotOk.delete(key);
+  retryAfter.delete(key);
+  syncAuthorButtons(author, rec);
+  schedulePersistCache();
+  return rec;
 }
 
 function checkAuthorCascade(author, priority = false) {
   const key = author.toLowerCase();
+  if (!key || SKIP_AUTHORS.has(key) || blockedAuthors.has(key)) return Promise.resolve(null);
   const now = Date.now();
   const cached = authorCache.get(key);
-  if (cached && cached.expiresAt > now && typeof cached.hasHot === 'boolean') {
+  if (cached && cached.expiresAt > now) {
     syncAuthorButtons(author, cached);
     return Promise.resolve(cached);
   }
-  if (!priority && (retryAfterMap.get(key) || 0) > now) {
-    return Promise.resolve(null);
-  }
-  if (inFlightChecks.has(key)) {
+  if (!priority && (retryAfter.get(key) || 0) > now) return Promise.resolve(null);
+  if (inFlight.has(key)) {
     if (priority) {
-      for (const item of fetchQueue) {
-        if (item.authorKey === key) {
-          item.priority = true;
-          item.seq = ++seqCounter;
-        }
-      }
+      fetchQueue.forEach((it) => { if (it.authorKey === key) { it.priority = true; it.seq = ++seqCounter; } });
       processQueue();
     }
-    return inFlightChecks.get(key);
+    return inFlight.get(key);
   }
 
-  const encoded = encodeURIComponent(author);
-  const topUrl = `${location.origin}/user/${encoded}/submitted.json?limit=5&sort=top&t=all&raw_json=1`;
-  const hotUrl = `${location.origin}/user/${encoded}/submitted.json?limit=5&sort=hot&raw_json=1`;
+  const enc = encodeURIComponent(author);
+  const topUrl = `${location.origin}/user/${enc}/submitted.json?limit=10&sort=top&t=all&raw_json=1`;
+  const hotUrl = `${location.origin}/user/${enc}/submitted.json?limit=10&sort=hot&raw_json=1`;
 
-  const promise = (async () => {
+  const prom = (async () => {
+    let topEmpty = (partialTopEmpty.get(key) || 0) > Date.now();
     try {
-      const hasTop = await fetchListingBool(topUrl, key, priority);
-      if (hasTop === null) return null;
-      if (hasTop === true) {
-        const record = { hasHot: true, hasTop: true, expiresAt: Date.now() + STATUS_TTL_MS };
-        authorCache.set(key, record);
-        retryAfterMap.delete(key);
-        syncAuthorButtons(author, record);
-        persistAuthorCache();
-        return record;
+      if (!topEmpty) {
+        const hasTop = await fetchListing(topUrl, key, priority);
+        if (hasTop === null) return null;
+        if (hasTop === true) return saveSettled(author, true, true);
+        topEmpty = true;
+        partialTopEmpty.set(key, Date.now() + 1_800_000);
+        syncAuthorButtons(author, { hasTop: false });
       }
-      syncAuthorButtons(author, { hasTop: false });
-      const hasHot = await fetchListingBool(hotUrl, key, priority);
+      if ((partialHotOk.get(key) || 0) > Date.now()) return saveSettled(author, true, false);
+      const hasHot = await fetchListing(hotUrl, key, true);
       if (hasHot === null) return null;
-      const record = {
-        hasHot: Boolean(hasHot),
-        hasTop: false,
-        expiresAt: Date.now() + STATUS_TTL_MS,
-      };
-      authorCache.set(key, record);
-      retryAfterMap.delete(key);
-      syncAuthorButtons(author, record);
-      persistAuthorCache();
-      return record;
+      return saveSettled(author, Boolean(hasHot), false);
     } catch (err) {
-      if (err instanceof RequestError && (err.status === 404 || err.status === 403)) {
-        const record = { hasHot: false, hasTop: false, expiresAt: Date.now() + STATUS_TTL_MS };
-        authorCache.set(key, record);
-        retryAfterMap.delete(key);
-        syncAuthorButtons(author, record);
-        persistAuthorCache();
-        return record;
-      }
-      retryAfterMap.set(key, Math.max(Date.now() + FAILURE_TTL_MS, rateLimitedUntil));
-      syncAuthorButtons(author, { hasHot: null, hasTop: null, error: err?.message || 'Error' });
+      if (err instanceof RequestError && (err.status === 404 || err.status === 403)) return saveSettled(author, false, false);
+      retryAfter.set(key, Math.max(Date.now() + FAIL_TTL_MS, readQuotaState().rateLimitedUntil));
+      syncAuthorButtons(author, { hasHot: null, hasTop: topEmpty ? false : null });
       return null;
     } finally {
-      inFlightChecks.delete(key);
+      inFlight.delete(key);
     }
   })();
 
-  inFlightChecks.set(key, promise);
-  return promise;
+  inFlight.set(key, prom);
+  return prom;
+}
+
+function bindHoverStop(btn) {
+  btn.addEventListener('mouseenter', () => { if (!btn.disabled) btn.style.background = btn.dataset.bgHover; });
+  btn.addEventListener('mouseleave', () => { btn.style.background = btn.dataset.bg; });
+  ['pointerdown', 'mousedown', 'mouseup'].forEach((ev) => btn.addEventListener(ev, (e) => e.stopPropagation()));
 }
 
 function createLinkBtn(text, url) {
@@ -561,566 +447,324 @@ function createLinkBtn(text, url) {
   btn.textContent = text;
   btn.style.cssText = BASE_BTN_STYLE;
   applyTheme(btn, NORMAL_THEME);
-  bindHoverAndStopPropagation(btn);
-  btn.dataset.postsState = 'unknown';
-
-  const activate = (e) => {
+  bindHoverStop(btn);
+  const onClick = (e) => {
     if (e.button !== 0 && e.button !== 1) return;
     e.stopPropagation();
     e.stopImmediatePropagation();
-    if (btn.dataset.postsState === 'empty') {
-      e.preventDefault();
-      return;
-    }
-    const useCurrentTab =
-      e.button === 0 &&
-      !e.ctrlKey &&
-      !e.metaKey &&
-      !e.shiftKey &&
-      !e.altKey &&
-      /^\/(?:user|u)\/[^/]+(?:\/|$)/i.test(location.pathname);
-    if (useCurrentTab) {
+    if (btn.dataset.postsState === 'empty') { e.preventDefault(); return; }
+    if (e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && /^\/(?:user|u)\/[^/]+/i.test(location.pathname)) {
       e.preventDefault();
       location.assign(fullUrl);
-    } else if (e.defaultPrevented) {
-      window.open(fullUrl, '_blank', 'noopener,noreferrer');
     }
   };
-  btn.addEventListener('click', activate);
-  btn.addEventListener('auxclick', (e) => {
-    if (e.button === 1) activate(e);
-  });
+  btn.addEventListener('click', onClick);
+  btn.addEventListener('auxclick', (e) => { if (e.button === 1) onClick(e); });
   return btn;
 }
 
-function getCsrfCookie() {
-  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : '';
-}
-
-function getDomToken() {
-  const domUh = document.querySelector('input[name="uh"]')?.value;
-  if (domUh) return domUh;
-  const app = document.querySelector('shreddit-app');
-  return app?.csrfToken || app?.getAttribute('csrf-token') || app?.getAttribute('spp') || '';
-}
-
-async function getModhash() {
-  const domUh = document.querySelector('input[name="uh"]')?.value;
-  if (domUh) return domUh;
-  if (cachedModhash) return cachedModhash;
-  if (!modhashPromise) {
-    modhashPromise = fetchJsonDirect(`${location.origin}/api/me.json`)
-      .then((d) => {
-        const uh = d?.data?.modhash || '';
-        if (uh) cachedModhash = uh;
-        return uh;
-      })
-      .catch(() => '')
-      .finally(() => {
-        modhashPromise = null;
-      });
-  }
-  return modhashPromise;
-}
-
-async function resolveAccountId(author, initialId) {
-  if (/^t2_[a-z0-9]+$/i.test(initialId || '')) return initialId;
-  try {
-    const profile = await fetchJsonDirect(
-      `${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`
-    );
-    const id = profile?.data?.id;
-    return typeof id === 'string' && /^[a-z0-9]+$/i.test(id) ? `t2_${id}` : '';
-  } catch {
-    return '';
-  }
-}
-
-async function sendBlockPost(author, accountId, uh, csrfToken) {
-  const params = new URLSearchParams();
-  params.set('name', author);
-  params.set('api_type', 'json');
-  if (uh) params.set('uh', uh);
-  if (accountId) params.set('account_id', accountId);
-
-  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
-  if (uh) headers['X-Modhash'] = uh;
-  if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
-
-  await fetchJsonDirect(`${location.origin}/api/block_user`, {
-    method: 'POST',
-    headers,
-    body: params.toString(),
-  });
-}
-
 async function blockAccountRequest(author, authorId) {
-  const csrfToken = getCsrfCookie() || getDomToken();
-  const validInitialId = /^t2_[a-z0-9]+$/i.test(authorId || '') ? authorId : '';
-  const uh = await getModhash();
-  if (!uh && !csrfToken) {
-    throw new RequestError('No session token (check that you are signed in).');
+  const cookieM = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+  const app = document.querySelector('shreddit-app');
+  const csrf = (cookieM ? decodeURIComponent(cookieM[1]) : '') || app?.csrfToken || app?.getAttribute('csrf-token') || '';
+  let uh = document.querySelector('input[name="uh"]')?.value || cachedModhash;
+  if (!uh && !modhashPromise) {
+    modhashPromise = fetchJsonDirect(`${location.origin}/api/me.json`).then((d) => (cachedModhash = d?.data?.modhash || '')).catch(() => '').finally(() => { modhashPromise = null; });
   }
-  try {
-    await sendBlockPost(author, validInitialId, uh, csrfToken);
-  } catch (firstErr) {
-    if (firstErr.status === 429) throw firstErr;
-    if (!validInitialId) {
-      const resolvedId = await resolveAccountId(author, '');
-      if (resolvedId) {
-        await sendBlockPost(author, resolvedId, uh, csrfToken);
-        return;
-      }
-    }
-    throw firstErr;
-  }
-}
+  if (!uh && modhashPromise) uh = await modhashPromise;
+  if (!uh && !csrf) throw new RequestError('Not signed in');
 
-function enqueueBlockTask(fn) {
-  const run = async () => {
-    const waitMs = Math.max(nextBlockAllowedAt, rateLimitedUntil) - Date.now();
-    if (waitMs > 0 && rateLimitedUntil <= Date.now()) {
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-    try {
-      return await fn();
-    } finally {
-      nextBlockAllowedAt = Date.now() + BLOCK_COOLDOWN_MS;
-    }
+  const sendPost = async (accId) => {
+    const p = new URLSearchParams({ name: author, api_type: 'json' });
+    if (uh) p.set('uh', uh);
+    if (accId) p.set('account_id', accId);
+    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+    if (uh) headers['X-Modhash'] = uh;
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    await fetchJsonDirect(`${location.origin}/api/block_user`, { method: 'POST', headers, body: p.toString() });
   };
-  const taskPromise = blockChain.then(run, run);
-  blockChain = taskPromise.catch(() => {});
-  return taskPromise;
+
+  const validId = /^t2_[a-z0-9]+$/i.test(authorId || '') ? authorId : '';
+  try {
+    await sendPost(validId);
+  } catch (err) {
+    if (err.status === 429 || validId) throw err;
+    const prof = await fetchJsonDirect(`${location.origin}/user/${encodeURIComponent(author)}/about.json?raw_json=1`).catch(() => null);
+    const resolved = prof?.data?.id ? `t2_${prof.data.id}` : '';
+    if (!resolved) throw err;
+    await sendPost(resolved);
+  }
 }
 
-function setBlockBtnContent(btn, iconText, labelText) {
-  btn.textContent = '';
-  const icon = document.createElement('span');
-  icon.textContent = iconText;
-  icon.style.cssText = 'font-size:12px;line-height:1;';
-  const label = document.createElement('span');
-  label.textContent = labelText;
-  btn.appendChild(icon);
-  btn.appendChild(label);
-}
-
-function renderBlockButton(btn, author, error = null) {
+function renderBlockBtn(btn, author) {
   const key = author.toLowerCase();
-  const activeError = error || authorErrors.get(key) || null;
-  btn.title = '';
-  btn.removeAttribute('aria-label');
-
+  const err = authorErrors.get(key);
   if (blockedAuthors.has(key)) {
     applyTheme(btn, BLOCKED_THEME);
     btn.textContent = '✓ Blocked';
-    btn.style.cursor = 'default';
     btn.disabled = true;
   } else if (pendingBlocks.has(key)) {
     applyTheme(btn, BLOCK_THEME);
-    setBlockBtnContent(btn, '⋯', 'Blocking');
-    btn.title = 'Waiting for Reddit to confirm the block.';
-    btn.style.cursor = 'wait';
+    btn.textContent = '⋯ Blocking';
     btn.disabled = true;
-  } else if (activeError) {
-    const isLocked = btn.dataset.errorLocked === 'true';
+  } else if (err) {
+    const locked = btn.dataset.errorLocked === 'true';
     applyTheme(btn, EMPTY_THEME);
-    setBlockBtnContent(btn, '✕', isLocked ? 'Wait...' : 'Retry block');
-    btn.title = activeError.message;
-    btn.setAttribute('aria-label', btn.title);
-    btn.disabled = isLocked;
-    btn.style.cursor = isLocked ? 'not-allowed' : 'pointer';
+    btn.textContent = locked ? '✕ Wait...' : '✕ Retry block';
+    btn.title = err.message || '';
+    btn.disabled = locked;
   } else {
-    btn.disabled = false;
-    btn.style.cursor = 'pointer';
     applyTheme(btn, BLOCK_THEME);
-    setBlockBtnContent(btn, '⊘', 'Block');
+    btn.textContent = '⊘ Block';
+    btn.disabled = false;
   }
 }
 
-function updateBlockButtons(author, error = null) {
+function updateBlockButtons(author) {
   const key = author.toLowerCase();
-  document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
-    if ((wrap.dataset.author || '').toLowerCase() !== key) return;
-    const blockBtn = wrap.querySelector('[data-role="block"]');
-    if (blockBtn) renderBlockButton(blockBtn, author, error);
-    const post = wrap.closest(POST_SELECTOR);
-    if (post && blockedAuthors.has(key)) dimPost(post);
+  document.querySelectorAll(`.${WRAP_CLASS}`).forEach((w) => {
+    if ((w.dataset.author || '').toLowerCase() !== key) return;
+    renderBlockBtn(w.querySelector('[data-role="block"]'), author);
+    const post = w.closest(POST_SELECTOR);
+    if (post && blockedAuthors.has(key)) {
+      if (!dimmedPosts.has(post)) dimmedPosts.set(post, post.style.opacity);
+      post.style.opacity = '0.35';
+    }
   });
 }
 
-function lockAuthorButtonsTemporarily(author, ms) {
-  const key = author.toLowerCase();
-  document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
-    if ((wrap.dataset.author || '').toLowerCase() !== key) return;
-    const blockBtn = wrap.querySelector('[data-role="block"]');
-    if (blockBtn) blockBtn.dataset.errorLocked = 'true';
-  });
-  updateBlockButtons(author);
-  setTimeout(() => {
-    document.querySelectorAll(`.${WRAP_CLASS}`).forEach((wrap) => {
-      if ((wrap.dataset.author || '').toLowerCase() !== key) return;
-      const blockBtn = wrap.querySelector('[data-role="block"]');
-      if (blockBtn) delete blockBtn.dataset.errorLocked;
-    });
-    updateBlockButtons(author);
-  }, ms);
-}
-
-function createBlockBtn(author, initialAuthorId) {
+function createBlockBtn(author, initialId) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.dataset.role = 'block';
-  btn.setAttribute('aria-live', 'polite');
   btn.style.cssText = BASE_BTN_STYLE;
-  bindHoverAndStopPropagation(btn);
-  renderBlockButton(btn, author);
+  bindHoverStop(btn);
+  renderBlockBtn(btn, author);
 
   btn.addEventListener('click', async (e) => {
     e.preventDefault();
     e.stopPropagation();
     e.stopImmediatePropagation();
     const wrap = btn.closest(`.${WRAP_CLASS}`);
-    const currentAuthor = wrap?.dataset?.author || author;
-    const currentAuthorId = wrap?.dataset?.authorId || initialAuthorId;
-    const key = currentAuthor.toLowerCase();
+    const curAuthor = wrap?.dataset?.author || author;
+    const curId = wrap?.dataset?.authorId || initialId;
+    const key = curAuthor.toLowerCase();
     if (btn.disabled || pendingBlocks.has(key) || blockedAuthors.has(key)) return;
 
     authorErrors.delete(key);
     pendingBlocks.add(key);
-    updateBlockButtons(currentAuthor);
-    processQueue();
-
-    let failure = null;
+    updateBlockButtons(curAuthor);
     try {
-      await enqueueBlockTask(() => blockAccountRequest(currentAuthor, currentAuthorId));
+      const run = async () => {
+        const wait = Math.max(nextBlockAt, readQuotaState().rateLimitedUntil) - Date.now();
+        if (wait > 0 && readQuotaState().rateLimitedUntil <= Date.now()) await new Promise((r) => setTimeout(r, wait));
+        try { return await blockAccountRequest(curAuthor, curId); } finally { nextBlockAt = Date.now() + BLOCK_COOLDOWN_MS; }
+      };
+      const p = blockChain.then(run, run);
+      blockChain = p.catch(() => {});
+      await p;
       blockedAuthors.add(key);
-      saveBlockedAuthors();
-      updateBlockButtons(currentAuthor);
+      writeJson(BLOCKED_KEY, [...blockedAuthors]);
     } catch (err) {
-      failure = err;
       authorErrors.set(key, err);
-      if (err.status === 401 || err.status === 403) cachedModhash = '';
     } finally {
       pendingBlocks.delete(key);
-      if (failure) {
-        const lockMs =
-          failure.status === 429
-            ? Math.min(Math.max(rateLimitedUntil - Date.now(), ERROR_LOCK_MS), 15000)
-            : ERROR_LOCK_MS;
-        lockAuthorButtonsTemporarily(currentAuthor, lockMs);
-      } else {
-        updateBlockButtons(currentAuthor, null);
-      }
+      updateBlockButtons(curAuthor);
       processQueue();
     }
   });
   return btn;
 }
 
-function clearWrapTimers(wrap) {
-  const dTimer = dwellTimers.get(wrap);
-  if (dTimer !== undefined) {
-    clearTimeout(dTimer);
-    dwellTimers.delete(wrap);
-  }
-  const hTimer = hoverTimers.get(wrap);
-  if (hTimer !== undefined) {
-    clearTimeout(hTimer);
-    hoverTimers.delete(wrap);
-  }
-}
-
-function applyCachedStatusToWrap(wrap, author) {
-  const cached = authorCache.get(author.toLowerCase());
-  if (!cached || cached.expiresAt <= Date.now()) return false;
-  const postsBtn = wrap.querySelector('[data-role="posts"]');
-  const topBtn = wrap.querySelector('[data-role="top"]');
-  if (typeof cached.hasHot === 'boolean' && typeof cached.hasTop === 'boolean') {
-    renderListingState(postsBtn, cached.hasHot, 'Posts', 'No posts', '');
-    renderListingState(topBtn, cached.hasTop, 'Top posts', 'No top', '');
+function applyCacheToWrap(wrap, author) {
+  const key = author.toLowerCase();
+  const now = Date.now();
+  const c = authorCache.get(key);
+  if (c && c.expiresAt > now) {
+    renderListingBtn(wrap.querySelector('[data-role="posts"]'), c.hasHot, 'Posts', 'No posts');
+    renderListingBtn(wrap.querySelector('[data-role="top"]'), c.hasTop, 'Top posts', 'No top');
     return true;
   }
+  if ((partialTopEmpty.get(key) || 0) > now) renderListingBtn(wrap.querySelector('[data-role="top"]'), false, 'Top posts', 'No top');
+  if ((partialHotOk.get(key) || 0) > now) renderListingBtn(wrap.querySelector('[data-role="posts"]'), true, 'Posts', 'No posts');
   return false;
 }
 
-function handleVisibilityChange(wrap, isIntersecting) {
-  if (!wrap) return;
-  wrap.dataset.nearby = String(isIntersecting);
-  if (!isIntersecting) {
-    clearWrapTimers(wrap);
-    return;
-  }
-  const author = wrap.dataset.author || '';
-  if (!author || blockedAuthors.has(author.toLowerCase())) return;
-  if (applyCachedStatusToWrap(wrap, author)) return;
-
-  if (!dwellTimers.has(wrap)) {
-    const timer = setTimeout(() => {
-      dwellTimers.delete(wrap);
-      if (wrap.isConnected && wrap.dataset.nearby === 'true') {
-        checkAuthorCascade(author, false);
-      }
-    }, VIEWPORT_DWELL_MS);
-    dwellTimers.set(wrap, timer);
-  }
+function clearTimers(wrap) {
+  if (dwellTimers.has(wrap)) { clearTimeout(dwellTimers.get(wrap)); dwellTimers.delete(wrap); }
+  if (hoverTimers.has(wrap)) { clearTimeout(hoverTimers.get(wrap)); hoverTimers.delete(wrap); }
 }
 
 const visibilityObserver = new IntersectionObserver(
   (entries) => {
     entries.forEach((entry) => {
-      const target = entry.target;
-      const wrap = target.classList?.contains(WRAP_CLASS)
-        ? target
-        : postToWrapMap.get(target) || findOwnWrap(target);
-      if (wrap) handleVisibilityChange(wrap, entry.isIntersecting);
+      const wrap = entry.target.classList?.contains(WRAP_CLASS) ? entry.target : postToWrap.get(entry.target);
+      if (!wrap) return;
+      wrap.dataset.nearby = String(entry.isIntersecting);
+      if (!entry.isIntersecting) { clearTimers(wrap); return; }
+      const author = wrap.dataset.author || '';
+      if (!author || SKIP_AUTHORS.has(author.toLowerCase()) || blockedAuthors.has(author.toLowerCase())) return;
+      if (applyCacheToWrap(wrap, author)) return;
+      if (!dwellTimers.has(wrap)) {
+        dwellTimers.set(wrap, setTimeout(() => {
+          dwellTimers.delete(wrap);
+          if (wrap.isConnected && wrap.dataset.nearby === 'true') checkAuthorCascade(author, false);
+        }, DWELL_MS));
+      }
     });
     processQueue();
   },
-  { rootMargin: `${PREFETCH_MARGIN_PX}px` }
+  { rootMargin: '0px', threshold: 0.15 }
 );
 
 function normalizeAuthor(raw) {
-  if (!raw) return '';
-  return raw.trim().replace(/^(?:\/?(?:u|user)\/)/i, '');
+  return (raw || '').trim().replace(/^(?:\/?(?:u|user)\/)/i, '');
 }
 
-function extractAuthorId(post, modern) {
-  const direct = post.getAttribute(modern ? 'author-id' : 'data-author-fullname') || '';
-  if (/^t2_[a-z0-9]+$/i.test(direct)) return direct;
-  const candidates = post.querySelectorAll('[data-author-fullname], [author-id]');
-  for (const el of candidates) {
-    if (el.closest(POST_SELECTOR) !== post) continue;
-    const nested = el.getAttribute('author-id') || el.getAttribute('data-author-fullname') || '';
-    if (/^t2_[a-z0-9]+$/i.test(nested)) return nested;
-  }
-  return '';
+function isNestedCrosspost(post) {
+  return Boolean(post.parentElement?.closest(POST_SELECTOR));
 }
 
-function findCreditBar(post, modern) {
-  if (!modern) return post.querySelector('p.tagline');
-  const candidates = post.querySelectorAll(
-    '[slot="credit-bar"], [data-testid="post-author-header"], [slot="authorName"]'
-  );
-  for (const el of candidates) {
-    if (el.closest(POST_SELECTOR) === post) return el;
-  }
-  return null;
-}
-
-function extractAuthorFromBar(post, bar) {
-  const scope = bar || post;
-  const links = scope.querySelectorAll('a[href*="/user/"], a[href*="/u/"]');
-  for (const link of links) {
-    if (link.closest(`.${WRAP_CLASS}`)) continue;
-    if (link.closest(POST_SELECTOR) !== post) continue;
-    const href = link.getAttribute('href') || '';
-    const match = href.match(/\/(?:user|u)\/([^/?#]+)/i);
-    if (match && match[1]) {
-      const candidate = normalizeAuthor(decodeURIComponent(match[1]));
-      if (candidate && candidate !== 'me') return candidate;
-    }
-  }
-  return '';
-}
-
-function dimPost(post) {
-  if (!dimmedPosts.has(post)) dimmedPosts.set(post, post.style.opacity);
-  post.style.opacity = '0.35';
-}
-
-function findOwnWrap(post) {
-  const wraps = post.querySelectorAll(`.${WRAP_CLASS}`);
-  for (const wrap of wraps) {
-    if (wrap.closest(POST_SELECTOR) === post) return wrap;
-  }
-  return null;
-}
-
-function createBtnGroup(author, authorId, post = null) {
-  const encoded = encodeURIComponent(author);
-  const wrap = document.createElement('span');
-  wrap.className = WRAP_CLASS;
-  wrap.dataset.author = author;
-  wrap.dataset.authorId = authorId;
-  wrap.style.cssText =
-    'position:relative;z-index:10;pointer-events:auto;display:inline-flex;align-items:center;flex-wrap:nowrap;gap:5px;margin-left:auto;margin-right:6px;flex-shrink:0;';
-
-  const postsBtn = createLinkBtn('Posts', `/user/${encoded}/submitted/?sort=hot`);
-  postsBtn.dataset.role = 'posts';
-
-  const topBtn = createLinkBtn('Top posts', `/user/${encoded}/submitted/?sort=top&t=all`);
-  topBtn.dataset.role = 'top';
-
-  const blockBtn = createBlockBtn(author, authorId);
-
-  wrap.appendChild(postsBtn);
-  wrap.appendChild(topBtn);
-  wrap.appendChild(blockBtn);
-
-  applyCachedStatusToWrap(wrap, author);
-  const observeTarget = post || wrap;
-  if (post) postToWrapMap.set(post, wrap);
-  visibilityObserver.observe(observeTarget);
-
-  const cancelHover = () => {
-    const hTimer = hoverTimers.get(wrap);
-    if (hTimer !== undefined) {
-      clearTimeout(hTimer);
-      hoverTimers.delete(wrap);
-    }
-  };
-
-  const scheduleHover = () => {
-    cancelHover();
-    if (applyCachedStatusToWrap(wrap, author)) return;
-    const timer = setTimeout(() => {
-      hoverTimers.delete(wrap);
-      wrap.dataset.nearby = 'true';
-      checkAuthorCascade(author, true);
-    }, HOVER_DEBOUNCE_MS);
-    hoverTimers.set(wrap, timer);
-  };
-
-  [postsBtn, topBtn].forEach((btn) => {
-    btn.addEventListener('pointerenter', scheduleHover);
-    btn.addEventListener('focus', scheduleHover);
-    btn.addEventListener('pointerleave', cancelHover);
-    btn.addEventListener('blur', cancelHover);
-    btn.addEventListener('pointerdown', cancelHover);
-    btn.addEventListener('click', cancelHover);
-    btn.addEventListener('auxclick', cancelHover);
-  });
-
-  return wrap;
+function isProfilePage() {
+  return /^\/(?:user|u)\/[^/]+/i.test(location.pathname);
 }
 
 function processPost(post) {
   if (!post.isConnected) return;
   const modern = post.matches('shreddit-post');
-  const bar = findCreditBar(post, modern);
-  const author =
-    normalizeAuthor(post.getAttribute(modern ? 'author' : 'data-author')) ||
-    extractAuthorFromBar(post, bar);
-  const authorId = extractAuthorId(post, modern);
-
-  if (dimmedPosts.has(post) && !blockedAuthors.has(author.toLowerCase())) {
-    post.style.opacity = dimmedPosts.get(post);
-    dimmedPosts.delete(post);
+  const bar = !modern
+    ? post.querySelector('p.tagline')
+    : [...post.querySelectorAll('[slot="credit-bar"], [data-testid="post-author-header"], [slot="authorName"]')].find((el) => el.closest(POST_SELECTOR) === post);
+  let author = normalizeAuthor(post.getAttribute(modern ? 'author' : 'data-author'));
+  if (!author && bar) {
+    const link = [...bar.querySelectorAll('a[href*="/user/"], a[href*="/u/"]')].find((a) => !a.closest(`.${WRAP_CLASS}`) && a.closest(POST_SELECTOR) === post);
+    const m = link?.getAttribute('href')?.match(/\/(?:user|u)\/([^/?#]+)/i);
+    if (m?.[1]) author = normalizeAuthor(decodeURIComponent(m[1]));
   }
+  const directId = post.getAttribute(modern ? 'author-id' : 'data-author-fullname') || '';
+  const authorId = /^t2_[a-z0-9]+$/i.test(directId) ? directId : '';
 
-  const existing = findOwnWrap(post);
+  const existing = [...post.querySelectorAll(`.${WRAP_CLASS}`)].find((w) => w.closest(POST_SELECTOR) === post);
   if (existing) {
     if (existing.dataset.author === author) {
-      if (authorId && existing.dataset.authorId !== authorId) {
-        existing.dataset.authorId = authorId;
-      }
-      postToWrapMap.set(post, existing);
-      applyCachedStatusToWrap(existing, author);
+      if (authorId && existing.dataset.authorId !== authorId) existing.dataset.authorId = authorId;
+      postToWrap.set(post, existing);
+      applyCacheToWrap(existing, author);
       return;
     }
-    clearWrapTimers(existing);
+    clearTimers(existing);
     visibilityObserver.unobserve(post);
-    visibilityObserver.unobserve(existing);
-    postToWrapMap.delete(post);
     existing.remove();
-    processQueue();
+  }
+  if (!author || SKIP_AUTHORS.has(author.toLowerCase()) || !bar) return;
+
+  const enc = encodeURIComponent(author);
+  const wrap = document.createElement('span');
+  wrap.className = WRAP_CLASS;
+  wrap.dataset.author = author;
+  wrap.dataset.authorId = authorId;
+  wrap.style.cssText = 'position:relative;z-index:10;pointer-events:auto;display:inline-flex;align-items:center;flex-wrap:nowrap;gap:5px;margin-left:auto;margin-right:6px;flex-shrink:0;';
+
+  const postsBtn = createLinkBtn('Posts', `/user/${enc}/submitted/?sort=hot`);
+  postsBtn.dataset.role = 'posts';
+  const topBtn = createLinkBtn('Top posts', `/user/${enc}/submitted/?sort=top&t=all`);
+  topBtn.dataset.role = 'top';
+  const blockBtn = createBlockBtn(author, authorId);
+  wrap.append(postsBtn, topBtn, blockBtn);
+
+  applyCacheToWrap(wrap, author);
+  postToWrap.set(post, wrap);
+  if (!isProfilePage() && !isNestedCrosspost(post)) {
+    wrap.dataset.autoObserve = 'true';
+    visibilityObserver.observe(post);
   }
 
-  if (!author || author === '[deleted]' || !bar) return;
+  const cancelHover = () => { if (hoverTimers.has(wrap)) { clearTimeout(hoverTimers.get(wrap)); hoverTimers.delete(wrap); } };
+  const scheduleHover = () => {
+    cancelHover();
+    if (applyCacheToWrap(wrap, author)) return;
+    hoverTimers.set(wrap, setTimeout(() => { hoverTimers.delete(wrap); wrap.dataset.nearby = 'true'; checkAuthorCascade(author, true); }, HOVER_MS));
+  };
+  [postsBtn, topBtn].forEach((b) => {
+    b.addEventListener('pointerenter', scheduleHover);
+    b.addEventListener('focus', scheduleHover);
+    b.addEventListener('pointerleave', cancelHover);
+    b.addEventListener('blur', cancelHover);
+  });
 
-  const wrap = createBtnGroup(author, authorId, post);
   if (modern) {
     post.style.isolation = 'isolate';
-    bar.style.display = 'flex';
-    bar.style.flexWrap = 'wrap';
-    bar.style.alignItems = 'center';
-    bar.style.rowGap = '4px';
-    bar.style.paddingTop = '6px';
-
+    Object.assign(bar.style, { display: 'flex', flexWrap: 'wrap', alignItems: 'center', rowGap: '4px', paddingTop: '6px' });
     if (bar.firstElementChild) {
       bar.firstElementChild.after(wrap);
       if (wrap.nextElementSibling) wrap.nextElementSibling.style.marginLeft = '0';
-    } else {
-      bar.appendChild(wrap);
-    }
-  } else {
-    bar.appendChild(wrap);
-  }
+    } else bar.appendChild(wrap);
+  } else bar.appendChild(wrap);
 
-  if (blockedAuthors.has(author.toLowerCase())) dimPost(post);
+  if (blockedAuthors.has(author.toLowerCase())) updateBlockButtons(author);
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    hydrateRateLimit();
     hydrateAuthorCache();
+    document.querySelectorAll(`.${WRAP_CLASS}`).forEach((w) => {
+      const post = w.closest(POST_SELECTOR);
+      if (post && w.dataset.autoObserve === 'true') {
+        visibilityObserver.unobserve(post);
+        visibilityObserver.observe(post);
+      }
+    });
     processQueue();
   } else {
-    persistAuthorCache();
-    document.querySelectorAll(`.${WRAP_CLASS}`).forEach(clearWrapTimers);
+    persistAuthorCacheNow();
+    document.querySelectorAll(`.${WRAP_CLASS}`).forEach(clearTimers);
   }
 });
 
-if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-  window.addEventListener('pagehide', () => persistAuthorCache());
-  window.addEventListener('storage', (e) => {
-    if (!e || !e.key) return;
-    if (e.key === STATUS_STORAGE_KEY && e.newValue) {
-      hydrateAuthorCache();
-      for (const [k, v] of authorCache.entries()) {
-        syncAuthorButtons(k, v);
-      }
-    } else if (e.key === BLOCKED_STORAGE_KEY && e.newValue) {
-      try {
-        JSON.parse(e.newValue).forEach((a) => {
-          const lower = String(a).toLowerCase();
-          blockedAuthors.add(lower);
-          updateBlockButtons(lower);
-        });
-      } catch {}
-    } else if (e.key === RATELIMIT_STORAGE_KEY && e.newValue) {
-      hydrateRateLimit();
-      processQueue();
-    }
-  });
-}
-
-let rafScheduled = false;
-const pendingPosts = new Set();
-
-function collectPosts(node) {
-  if (node.nodeType !== 1) return;
-  if (node.matches(POST_SELECTOR)) pendingPosts.add(node);
-  const parentPost = node.closest(POST_SELECTOR);
-  if (parentPost) pendingPosts.add(parentPost);
-  node.querySelectorAll(POST_SELECTOR).forEach((p) => pendingPosts.add(p));
-}
-
-function scheduleProcessPosts(mutations) {
-  for (const m of mutations) {
-    if (m.target.nodeType === 1 && m.target.closest(`.${WRAP_CLASS}`)) continue;
-    if (m.type === 'attributes') {
-      collectPosts(m.target);
-      continue;
-    }
-    const parentPost = m.target.nodeType === 1 ? m.target.closest(POST_SELECTOR) : null;
-    if (parentPost) pendingPosts.add(parentPost);
-    m.addedNodes.forEach(collectPosts);
+window.addEventListener('pagehide', persistAuthorCacheNow);
+window.addEventListener('storage', (e) => {
+  if (!e?.key || !e.newValue) return;
+  if (e.key === STATUS_KEY) {
+    hydrateAuthorCache();
+    document.querySelectorAll(`.${WRAP_CLASS}`).forEach((w) => applyCacheToWrap(w, w.dataset.author || ''));
+  } else if (e.key === BLOCKED_KEY) {
+    const list = readJson(BLOCKED_KEY);
+    if (Array.isArray(list)) list.forEach((a) => { blockedAuthors.add(String(a).toLowerCase()); updateBlockButtons(String(a)); });
+  } else if (e.key === QUOTA_KEY) {
+    processQueue();
   }
-  if (rafScheduled || pendingPosts.size === 0) return;
-  rafScheduled = true;
-  requestAnimationFrame(() => {
-    rafScheduled = false;
-    const posts = [...pendingPosts];
-    pendingPosts.clear();
-    posts.forEach(processPost);
-  });
+});
+
+let rafPending = false;
+const dirtyPosts = new Set();
+function queueNodePosts(node) {
+  if (node?.nodeType !== 1) return;
+  if (node.matches(POST_SELECTOR)) dirtyPosts.add(node);
+  const p = node.closest(POST_SELECTOR);
+  if (p) dirtyPosts.add(p);
+  node.querySelectorAll(POST_SELECTOR).forEach((el) => dirtyPosts.add(el));
 }
 
 document.querySelectorAll(POST_SELECTOR).forEach(processPost);
 if (document.body) {
-  new MutationObserver(scheduleProcessPosts).observe(document.body, {
+  new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      if (m.target.nodeType === 1 && m.target.closest(`.${WRAP_CLASS}`)) continue;
+      if (m.type === 'attributes') queueNodePosts(m.target);
+      else {
+        if (m.target.nodeType === 1 && m.target.closest(POST_SELECTOR)) dirtyPosts.add(m.target.closest(POST_SELECTOR));
+        m.addedNodes.forEach(queueNodePosts);
+      }
+    }
+    if (rafPending || !dirtyPosts.size) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      const list = [...dirtyPosts];
+      dirtyPosts.clear();
+      list.forEach(processPost);
+    });
+  }).observe(document.body, {
     childList: true,
     subtree: true,
     attributes: true,
