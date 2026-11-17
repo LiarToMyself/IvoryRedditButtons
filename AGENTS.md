@@ -197,6 +197,8 @@ When the user corrects your approach, append a one-line rule here before ending 
 - When asked for a PR, call command Create PR from 10. Project context of these agent rules. Claim success only after a PR URL is returned. Link PR with "Fixes #<>" or "Closes #<>".
 - While coding, write microreports in the relevant feature folder under plans/code-micro-reports/ after each code step and commit it. Update its index. State the bug, the changed files, why the change helps, and what still needs a manual check. Use plain prose and GitHub links. Do not create empty plans ahead of work.
 - Prefix new document names in plans/ with their creation date in YYYY-MM-DD- format. Keep the existing numbering for code microreports. Keep plans/plan-index.md in sync with the plans/ catalog.
+- Never collapse `Posts` (`sort=hot`) and `Top posts` (`sort=top&t=all`) into a single status; always use the `sort=top&t=all` -> conditional `sort=hot` cascade so buttons color independently while resolving normal authors in 1 request.
+- Never auto-poll `.json` listings via `IntersectionObserver` on `/user/*` or `/u/*` profile pages or nested crossposts, and always migrate existing rate-limit timestamps across storage versions instead of wiping them.
 
 ---
 
