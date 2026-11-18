@@ -1,27 +1,23 @@
 # Changelog
 
-All notable changes to IvoryRedditButtons will be documented in this file.
+История версий расширения IvoryRedditButtons.
 
 ## [v1.4.4] - 2026-11-18
 
-### Summary
-Version 1.4.4 rewrites the core extension engine to eliminate HTTP 429 rate-limiting, separates UI styling into an external stylesheet, and speeds up feed and profile button updates.
+Компактная версия расширения с защитой от лимитов Reddit (HTTP 429), ускорением обновления кнопок и выносом оформления в отдельный файл стилей.
 
-### Added
-- External `styles.css` (109 lines) for clean styling and MV3 CSP compliance.
-- Complete architectural reference `EngineBlueprint.md`.
-- Shreddit partial endpoint transport with fallback to JSON.
-- Fast linked cascade for author post discovery (under 900ms).
-- Stepped queue startup (4.5s initial delay) to halve first-screen latency without 429s.
-- Isolated hover quota pool allowing instant checks regardless of background queue state.
-- Cross-tab synchronization of empty status via `chrome.storage.local`.
+### Главные изменения
+- Разделение кода: логика в `content.js` сокращена с 1129 до 514 строк, стили кнопок вынесены в `styles.css` (109 строк).
+- Устранение блокировок HTTP 429: сетевые запросы к `submitted.json` заменены на внутренний частичный эндпоинт Shreddit с откатом на JSON.
+- Ускорение проверки авторов: быстрый связанный каскад (1.8с в фоне, 200мс при наведении курсора), обновление статуса кнопок в ленте быстрее 900мс.
+- Изолированный лимит для наведения курсора: проверка карточки при наведении больше не блокируется фоновой очередью ленты.
+- Ступенчатый старт фоновой очереди: первая карточка стартует с задержкой 4.5с, снижая нагрузку на первом экране.
+- Устранение ложного покраснения кнопки Posts при переходе в пустые профили с сортировкой `sort=top`.
+- Фильтрация баннеров удаленных модераторами постов (`[slot="post-removed-banner"]`) для предотвращения ложного зеленого статуса.
+- Синхронизация статусов между вкладками браузера через `chrome.storage.local`.
+- Увеличение времени жизни кэша: до 24 часов для авторов с постами и до 4 часов для пустых профилей.
+- Добавлена архитектурная спецификация `EngineBlueprint.md`.
 
-### Fixed
-- Fixed HTTP 429 flood caused by redundant polling of `/user/<author>/submitted.json`.
-- Fixed false-red button states on empty profiles loaded with `sort=top`.
-- Fixed false-green button states on posts with moderation removal banners.
-- Fixed loss of second-step cascade requests on feed scroll.
+## [v1.4.3] - 2026-11-17
 
-### Changed
-- Compact `content.js` reduced from 1129 to 514 lines.
-- Extended cache TTL: 24 hours for authors with posts, 4 hours for empty profiles.
+- Реализован каскадный опрос Top -> Hot и удален избыточный код очереди.
