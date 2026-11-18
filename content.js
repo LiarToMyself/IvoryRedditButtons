@@ -22,7 +22,7 @@
   const extStore = typeof chrome !== 'undefined' && chrome?.storage?.local ? chrome.storage.local : null;
   const authorCache = new Map(), retryAfter = new Map(), blockErrors = new Map(), queue = new Map();
   const partialTopFalse = new Set(), partialHotTrue = new Set(), blocked = new Set(), pendingBlocks = new Set();
-  const timers = new WeakMap(), postToWrap = new WeakMap(), tabReadyAt = Date.now() + CFG.settleMs;
+  const timers = new WeakMap(), postToWrap = new WeakMap(); let tabReadyAt = Date.now() + CFG.settleMs;
   const rate = { limitedUntil: 0, pausedUntil: 0, slowUntil: 0, lastReqAt: 0, nextBgAt: 0, ts: [] };
   let activeKey = '', queueTimer = null, persistTimer = null, seq = 0, partialBroken = location.hostname === 'old.reddit.com';
   let cachedModhash = '', modhashPromise = null, blockChain = Promise.resolve(), nextBlockAt = 0, localLock = Promise.resolve();
@@ -66,8 +66,9 @@
   }
   function flushCache(syncOnly = false) {
     if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
-    if (syncOnly && !extStore) { const now = Date.now(); mergeStatus(readLs(K_STATUS), now); writeLs(K_STATUS, buildStatusMap(now)); return; }
-    return withLock('irb_cache_lock_v5', async () => { const now = Date.now(); mergeStatus(await storeGet(K_STATUS), now); await storeSet(K_STATUS, buildStatusMap(now)); }).catch(() => {});
+    const now = Date.now(); mergeStatus(readLs(K_STATUS), now); writeLs(K_STATUS, buildStatusMap(now));
+    if (syncOnly) return;
+    return withLock('irb_cache_lock_v5', async () => { const cur = Date.now(); mergeStatus(await storeGet(K_STATUS), cur); await storeSet(K_STATUS, buildStatusMap(cur)); }).catch(() => {});
   }
   const saveBlocked = () => withLock('irb_cache_lock_v5', async () => { const cur = await storeGet(K_BLOCKED); if (Array.isArray(cur)) cur.forEach((a) => blocked.add(String(a).toLowerCase())); await storeSet(K_BLOCKED, [...blocked]); });
   async function initStorage() {
@@ -171,9 +172,8 @@
         const e = new Error('Unexpected partial content'); e.status = 406; throw e;
       } catch (err) {
         if (err.status === 429 || err.settledEmpty) throw err;
-        const has = parseJsonListing(await fetchJson(jsonUrl, {}, true));
-        if (err.status === 406) partialBroken = true;
-        return has;
+        if (err.status === 404 || err.status === 403 || err.status === 406) partialBroken = true;
+        return parseJsonListing(await fetchJson(jsonUrl));
       }
     }
     return parseJsonListing(await fetchJson(jsonUrl));
@@ -194,8 +194,8 @@
         ? Math.max(rate.pausedUntil, rate.lastReqAt + CFG.hoverGapMs * scale)
         : Math.max(rate.pausedUntil, tabReadyAt, rate.nextBgAt)
     );
-    const maxMin = (isPri && isStep2) ? (slow ? 5 : CFG.totalMaxPerMin + 1) : (isPri || isStep2) ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
-    const max10m = (isPri || isStep2) ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
+    const maxMin = (isPri && isStep2) ? (slow ? 5 : CFG.totalMaxPerMin + 1) : isPri ? (slow ? 4 : CFG.totalMaxPerMin) : isStep2 ? (slow ? 3 : CFG.totalMaxPerMin - 1) : (slow ? 3 : CFG.bgMaxPerMin);
+    const max10m = isPri ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
     const inMin = rate.ts.filter((t) => t > now - 60000);
     if (inMin.length >= maxMin) until = Math.max(until, inMin[inMin.length - maxMin] + 60050);
     if (rate.ts.length >= max10m) until = Math.max(until, rate.ts[rate.ts.length - max10m] + 600050);
@@ -239,7 +239,7 @@
           const item = queue.get(pickKey), scale = rate.slowUntil > now ? 2 : 1;
           queue.delete(pickKey); rate.ts.push(now); rate.lastReqAt = Math.max(rate.lastReqAt, now);
           const u = rate.ts.length, bgGap = (u <= 1 ? 4500 : u < 12 ? 9000 : u < 20 ? 14000 : 20000) * scale + Math.floor(Math.random() * 400);
-          rate.nextBgAt = Math.max(rate.nextBgAt, now + (item.priority || item.step2 ? CFG.hoverGapMs * scale : bgGap));
+          rate.nextBgAt = Math.max(rate.nextBgAt, now + (item.priority ? CFG.hoverGapMs * scale : bgGap));
           return { key: pickKey, item };
         });
       } catch { activeKey = ''; return; }
@@ -255,7 +255,7 @@
         } else setStatus(key, Boolean(await fetchListingHasPosts(item.author, 'hot')), false);
       } catch (err) {
         if (err.status === 404 || err.status === 403) setStatus(key, false, false);
-        else { retryAfter.set(key, Math.max(Date.now() + CFG.failTtlMs, rate.limitedUntil)); syncDom(key, err?.message || 'Error'); }
+        else { retryAfter.set(key, Math.max(Date.now() + CFG.failTtlMs, rate.limitedUntil)); if (partialTopFalse.has(key)) queue.set(key, { author: item.author, priority: false, step2: true, seq: ++seq }); syncDom(key, err?.message || 'Error'); }
       } finally { activeKey = ''; pumpQueue(); }
     })();
   }
@@ -381,19 +381,17 @@
   }
   function seedEmptyProfileIfReady() {
     const ctx = getProfileCtx();
-    if (!ctx) return;
+    if (!ctx || (ctx.tab !== 'submitted' && ctx.tab !== 'posts')) return;
     const cur = authorCache.get(ctx.owner);
     if (cur?.expiresAt > Date.now() && (ctx.sort === 'top' ? cur.hasTop === false : cur.hasHot === false)) return;
-    if ([...document.querySelectorAll(POST_SEL)].some((p) => !p.matches(AD_SEL) && !p.hasAttribute('is-promoted') && !p.parentElement?.closest(POST_SEL) && !p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') && normAuthor(p.getAttribute(p.matches('shreddit-post') ? 'author' : 'data-author') || '').toLowerCase() === ctx.owner)) return;
+    if ([...document.querySelectorAll(POST_SEL)].some((p) => !p.matches(AD_SEL) && !p.hasAttribute('is-promoted') && !p.parentElement?.closest(POST_SEL) && !p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') && !p.getAttribute('removed-by-category') && p.getAttribute('is-removed') !== 'true' && normAuthor(p.getAttribute(p.matches('shreddit-post') ? 'author' : 'data-author') || '').toLowerCase() === ctx.owner)) return;
     const emptyEl = document.querySelector('p#noresults.error, [data-testid="empty-state"], shreddit-empty-state, faceplate-partial[name*="empty"]');
     const textEmpty = /hasn't posted yet|no posts yet|doesn't seem to be anything here|keeps their posts hidden|hidden their posts/.test((document.querySelector('main, [role="main"]')?.textContent || '').toLowerCase());
     if (!emptyEl && !textEmpty) return;
     if (ctx.sort === 'top') {
-      if (typeof cur?.hasHot === 'boolean') setStatus(ctx.owner, cur.hasHot, false);
-      else { partialTopFalse.add(ctx.owner); syncDom(ctx.owner); }
-    } else if (ctx.sort === 'hot' || textEmpty) {
-      setStatus(ctx.owner, false, false);
-    }
+      if (ctx.t && ctx.t !== 'all') return;
+      if (typeof cur?.hasHot === 'boolean') setStatus(ctx.owner, cur.hasHot, false); else { partialTopFalse.add(ctx.owner); syncDom(ctx.owner); }
+    } else if (ctx.sort === 'hot' || textEmpty) setStatus(ctx.owner, false, false);
   }
   function createWrap(author, authorId, noAuto) {
     const enc = encodeURIComponent(author), wrap = document.createElement('span');
@@ -451,10 +449,10 @@
       clearTimers(existing); observer.unobserve(post); postToWrap.delete(post); existing.remove();
     }
     if (!author || SKIP_AUTHORS.has(key) || !bar) return;
-    const isRemoved = Boolean(post.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') || post.matches(AD_SEL) || post.hasAttribute('is-promoted'));
+    const isRemoved = Boolean(post.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') || post.matches(AD_SEL) || post.hasAttribute('is-promoted') || post.getAttribute('removed-by-category') || post.getAttribute('is-removed') === 'true');
     if (isOwnerSubmitted && !isRemoved) {
       if (prof.sort === 'top') setStatus(key, true, true);
-      else if (prof.sort === 'hot') { const cur = authorCache.get(key); if (cur?.expiresAt > Date.now()) setStatus(key, true, cur.hasTop); else partialHotTrue.add(key); }
+      else if (prof.sort === 'hot') { const cur = authorCache.get(key); if (cur?.expiresAt > Date.now()) setStatus(key, true, cur.hasTop); else { partialHotTrue.add(key); syncDom(key); } }
     }
     const wrap = createWrap(author, authorId, noAuto);
     if (modern) {
@@ -491,8 +489,13 @@
     (n.matches(`.${WRAP}`) ? [n] : [...n.querySelectorAll(`.${WRAP}`)]).forEach((w) => { clearTimers(w); w.dataset.nearby = 'false'; });
     (n.matches(POST_SEL) ? [n, ...n.querySelectorAll(POST_SEL)] : [...n.querySelectorAll(POST_SEL)]).forEach((p) => { observer.unobserve(p); postToWrap.delete(p); });
   };
-  let lastUrl = location.href;
-  const onNav = () => { if (location.href !== lastUrl) { lastUrl = location.href; seedEmptyProfileIfReady(); } };
+  let lastUrl = location.href, navTimer = null;
+  const onNav = () => {
+    if (location.href === lastUrl) return;
+    lastUrl = location.href; tabReadyAt = Date.now() + CFG.settleMs;
+    if (navTimer) clearTimeout(navTimer);
+    navTimer = setTimeout(() => { navTimer = null; ready.then(seedEmptyProfileIfReady); }, CFG.settleMs);
+  };
   window.addEventListener('popstate', onNav);
   document.querySelectorAll(POST_SEL).forEach(processPost);
   setTimeout(() => ready.then(seedEmptyProfileIfReady), CFG.settleMs);
