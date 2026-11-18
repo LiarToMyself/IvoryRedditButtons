@@ -19,7 +19,7 @@
     maxCache: 1000, blockCooldownMs: 1500, errorLockMs: 2000,
   };
 
-  const extStore = typeof chrome !== 'undefined' && chrome?.storage?.local ? chrome.storage.local : null;
+  const isExtValid = () => { try { return Boolean(typeof chrome !== 'undefined' && (!chrome.runtime || chrome.runtime.id)); } catch { return false; } }, getExtStore = () => (isExtValid() && chrome?.storage?.local ? chrome.storage.local : null);
   const authorCache = new Map(), retryAfter = new Map(), blockErrors = new Map(), queue = new Map();
   const partialTopFalse = new Set(), partialHotTrue = new Set(), blocked = new Set(), pendingBlocks = new Set();
   const timers = new WeakMap(), postToWrap = new WeakMap(); let tabReadyAt = Date.now() + CFG.settleMs;
@@ -31,8 +31,8 @@
   const normAuthor = (raw) => safeDecode(raw).trim().replace(/^\/?(?:u|user)\//i, '');
   const readLs = (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } };
   const writeLs = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
-  const storeGet = async (k) => { if (extStore) { try { const r = await extStore.get(k); return r && k in r ? r[k] : null; } catch {} } return readLs(k); };
-  const storeSet = async (k, v) => { writeLs(k, v); if (extStore) { try { await extStore.set({ [k]: v }); return; } catch {} } };
+  const storeGet = async (k) => { const s = getExtStore(); if (s) { try { const r = await s.get(k); return r && k in r ? r[k] : null; } catch {} } return readLs(k); };
+  const storeSet = async (k, v) => { writeLs(k, v); const s = getExtStore(); if (s) { try { await s.set({ [k]: v }); return; } catch {} } };
   const withLock = (name, fn) => {
     if (typeof navigator !== 'undefined' && navigator.locks?.request) return navigator.locks.request(name, fn);
     const p = localLock.then(fn, fn); localLock = p.catch(() => {}); return p;
@@ -72,21 +72,21 @@
   }
   const saveBlocked = () => withLock('irb_cache_lock_v5', async () => { const cur = await storeGet(K_BLOCKED); if (Array.isArray(cur)) cur.forEach((a) => blocked.add(String(a).toLowerCase())); await storeSet(K_BLOCKED, [...blocked]); });
   async function initStorage() {
-    const now = Date.now(), allExt = extStore ? await extStore.get([...LEGACY_RATE, K_RATE, K_STATUS, K_BLOCKED]).catch(() => ({})) : {};
+    const now = Date.now(), s = getExtStore(), allExt = s ? await s.get([...LEGACY_RATE, K_RATE, K_STATUS, K_BLOCKED]).catch(() => ({})) : {};
     let migrated = false;
     for (const k of LEGACY_RATE) {
       const vals = [readLs(k), allExt[k]]; try { const ss = sessionStorage.getItem(k); if (ss) vals.push(JSON.parse(ss)); } catch {}
       vals.filter(Boolean).forEach((v) => { mergeRate(v, now); migrated = true; });
     }
     mergeRate(allExt[K_RATE] || readLs(K_RATE), now);
-    if (extStore && readLs(K_RATE)) { mergeRate(readLs(K_RATE), now); migrated = true; }
+    if (s && readLs(K_RATE)) { mergeRate(readLs(K_RATE), now); migrated = true; }
     if (migrated) await storeSet(K_RATE, rate);
-    [readLs(LEGACY_STATUS[3]), allExt[K_STATUS], readLs(K_STATUS)].forEach((s) => mergeStatus(s, now));
+    [readLs(LEGACY_STATUS[3]), allExt[K_STATUS], readLs(K_STATUS)].forEach((st) => mergeStatus(st, now));
     [allExt[K_BLOCKED], readLs(K_BLOCKED)].forEach((a) => { if (Array.isArray(a)) a.forEach((u) => blocked.add(String(u).toLowerCase())); });
     try { cachedModhash = sessionStorage.getItem(K_MODHASH) || ''; } catch {}
     const legacy = [...LEGACY_RATE, ...LEGACY_STATUS];
     legacy.forEach((k) => { try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch {} });
-    if (extStore) await extStore.remove(legacy).catch(() => {});
+    if (s) await s.remove(legacy).catch(() => {});
     syncDom();
   }
   const ready = initStorage().catch(() => {});
@@ -105,7 +105,7 @@
   }
   const set429 = (waitMs, now) => { rate.limitedUntil = Math.max(rate.limitedUntil, now + Math.max(waitMs, CFG.fallback429Ms)); rate.slowUntil = Math.max(rate.slowUntil, rate.limitedUntil + CFG.slowAfter429Ms); };
   const assertNotLimited = (now) => { if (rate.limitedUntil > now) { const e = new Error(`Rate limit active (${Math.ceil((rate.limitedUntil - now) / 1000)}s)`); e.status = 429; throw e; } };
-  const MISSING_USER_RE = /Sorry,\s+nobody on Reddit goes by that name\.|This account has been suspended/i;
+  const MISSING_USER_RE = /Sorry,\s+nobody on Reddit goes by that name\.|This account has been suspended|user has been banned|page not found/i;
 
   async function fetchRaw(url, opts = {}, accept = 'application/json', countDirect = false) {
     await ready;
@@ -148,14 +148,14 @@
     return data;
   }
 
+  const isPostRemoved = (p) => Boolean(p.matches(AD_SEL) || p.hasAttribute('is-promoted') || p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') || p.getAttribute('removed-by-category') || p.getAttribute('is-removed') === 'true');
   const isVisibleSubmissionItem = (c) => Boolean(c?.data && (!c.kind || c.kind === 't3') && !c.data.removed_by_category && c.data.removed !== true && c.data.spam !== true && c.data.hidden !== true && c.data.author !== '[deleted]');
   const parseJsonListing = (d) => { if (d?.kind !== 'Listing' || !Array.isArray(d?.data?.children)) throw new Error('Invalid listing'); return d.data.children.some(isVisibleSubmissionItem); };
   function hasVisiblePartialPost(html) {
     if (typeof DOMParser === 'undefined') return /<shreddit-post\b/i.test(html) && !/slot\s*=\s*["'](?:post-removed-banner|mod-status)["']/i.test(html);
     return [...new DOMParser().parseFromString(html, 'text/html').querySelectorAll('shreddit-post')].some((p) => {
       const a = (p.getAttribute('author') || '').trim().toLowerCase();
-      return !p.parentElement?.closest('shreddit-post') && !p.hasAttribute('is-promoted') && !p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]')
-        && !p.getAttribute('removed-by-category') && p.getAttribute('is-removed') !== 'true' && a !== '[deleted]' && a !== '[removed]';
+      return !p.parentElement?.closest('shreddit-post') && !isPostRemoved(p) && a !== '[deleted]' && a !== '[removed]';
     });
   }
   async function fetchListingHasPosts(author, sort) {
@@ -171,8 +171,8 @@
         if (isHtml && !isShell && (/<faceplate-batch\b|<shreddit-post\b/i.test(text) || !/^\s*(?:<!doctype|<html\b)/i.test(text))) return hasVisiblePartialPost(text);
         const e = new Error('Unexpected partial content'); e.status = 406; throw e;
       } catch (err) {
-        if (err.status === 429 || err.settledEmpty) throw err;
-        if (err.status === 404 || err.status === 403 || err.status === 406) partialBroken = true;
+        if (err.status === 429 || err.status === 404 || err.status === 403 || err.settledEmpty) throw err;
+        if (err.status === 406) partialBroken = true;
         return parseJsonListing(await fetchJson(jsonUrl));
       }
     }
@@ -194,7 +194,7 @@
         ? Math.max(rate.pausedUntil, rate.lastReqAt + CFG.hoverGapMs * scale)
         : Math.max(rate.pausedUntil, tabReadyAt, rate.nextBgAt)
     );
-    const maxMin = (isPri && isStep2) ? (slow ? 5 : CFG.totalMaxPerMin + 1) : isPri ? (slow ? 4 : CFG.totalMaxPerMin) : isStep2 ? (slow ? 3 : CFG.totalMaxPerMin - 1) : (slow ? 3 : CFG.bgMaxPerMin);
+    const maxMin = (isPri && isStep2) ? (slow ? 5 : CFG.totalMaxPerMin + 1) : isPri ? (slow ? 4 : CFG.totalMaxPerMin) : (slow ? 3 : CFG.bgMaxPerMin);
     const max10m = isPri ? (slow ? 16 : CFG.totalMaxPer10Min) : (slow ? 12 : CFG.bgMaxPer10Min);
     const inMin = rate.ts.filter((t) => t > now - 60000);
     if (inMin.length >= maxMin) until = Math.max(until, inMin[inMin.length - maxMin] + 60050);
@@ -231,7 +231,7 @@
           pruneQueue(now);
           let pickKey = '', best = -Infinity, minWait = Infinity;
           for (const [k, item] of queue) {
-            const wait = blockedUntil(item, now) - now;
+            const wait = Math.max(blockedUntil(item, now), retryAfter.get(k) || 0) - now;
             if (wait <= 0) { const sc = (item.priority ? 1e9 : 0) + (item.step2 ? 1e6 : 0) + item.seq; if (sc > best) { best = sc; pickKey = k; } }
             else if (wait < minWait) minWait = wait;
           }
@@ -239,8 +239,7 @@
           const item = queue.get(pickKey), scale = rate.slowUntil > now ? 2 : 1;
           queue.delete(pickKey); rate.ts.push(now); rate.lastReqAt = Math.max(rate.lastReqAt, now);
           const u = rate.ts.length, bgGap = (u <= 1 ? 4500 : u < 12 ? 9000 : u < 20 ? 14000 : 20000) * scale + Math.floor(Math.random() * 400);
-          rate.nextBgAt = Math.max(rate.nextBgAt, now + (item.priority ? CFG.hoverGapMs * scale : bgGap));
-          return { key: pickKey, item };
+          rate.nextBgAt = Math.max(rate.nextBgAt, now + (item.priority ? CFG.hoverGapMs * scale : bgGap)); return { key: pickKey, item };
         });
       } catch { activeKey = ''; return; }
       if (!slot?.item) { activeKey = ''; if (Number.isFinite(slot?.wait) && slot.wait > 0) queueTimer = setTimeout(pumpQueue, Math.min(slot.wait + 25, 60000)); return; }
@@ -254,8 +253,11 @@
           queue.set(key, { author: item.author, priority: Boolean(item.priority || queue.get(key)?.priority), step2: true, seq: ++seq });
         } else setStatus(key, Boolean(await fetchListingHasPosts(item.author, 'hot')), false);
       } catch (err) {
-        if (err.status === 404 || err.status === 403) setStatus(key, false, false);
-        else { retryAfter.set(key, Math.max(Date.now() + CFG.failTtlMs, rate.limitedUntil)); if (partialTopFalse.has(key)) queue.set(key, { author: item.author, priority: false, step2: true, seq: ++seq }); syncDom(key, err?.message || 'Error'); }
+        if (err.status === 404 || err.status === 403 || err.settledEmpty) setStatus(key, false, false);
+        else {
+          retryAfter.set(key, Math.max(Date.now() + CFG.failTtlMs, rate.limitedUntil)); syncDom(key, err?.message || 'Error');
+          if (partialTopFalse.has(key) || isNearby(key)) queue.set(key, { author: item.author, priority: Boolean(item.priority || queue.get(key)?.priority), step2: true, seq: ++seq });
+        }
       } finally { activeKey = ''; pumpQueue(); }
     })();
   }
@@ -313,8 +315,7 @@
       };
       const p = blockChain.then(run, run); blockChain = p.catch(() => {}); await p;
       blocked.add(key); await saveBlocked();
-    } catch (err) { fail = err; blockErrors.set(key, err); if (err.status === 401 || err.status === 403) clearModhash(); }
-    finally {
+    } catch (err) { fail = err; blockErrors.set(key, err); if (err.status === 401 || err.status === 403) clearModhash(); } finally {
       pendingBlocks.delete(key);
       if (fail) {
         const ms = fail.status === 429 ? Math.min(Math.max(rate.limitedUntil - Date.now(), CFG.errorLockMs), 15000) : CFG.errorLockMs;
@@ -333,8 +334,7 @@
     btn.dataset.postsState = state === null ? 'unknown' : state ? 'present' : 'empty';
     btn.title = state === null && errMsg ? `Could not check posts: ${errMsg}` : '';
     btn.classList.toggle('irb-empty', state === false); btn.textContent = '';
-    if (state === false) { const b = document.createElement('span'); b.className = 'irb-badge'; b.textContent = '✕'; const t = document.createElement('span'); t.textContent = emptyLabel; btn.append(b, t); }
-    else btn.textContent = label;
+    if (state === false) { const b = document.createElement('span'); b.className = 'irb-badge'; b.textContent = '✕'; const t = document.createElement('span'); t.textContent = emptyLabel; btn.append(b, t); } else btn.textContent = label;
   }
   function syncWrap(wrap, errMsg = '') {
     const key = (wrap.dataset.author || '').toLowerCase(), rec = authorCache.get(key), valid = Boolean(rec && rec.expiresAt > Date.now());
@@ -384,13 +384,13 @@
     if (!ctx || (ctx.tab !== 'submitted' && ctx.tab !== 'posts')) return;
     const cur = authorCache.get(ctx.owner);
     if (cur?.expiresAt > Date.now() && (ctx.sort === 'top' ? cur.hasTop === false : cur.hasHot === false)) return;
-    if ([...document.querySelectorAll(POST_SEL)].some((p) => !p.matches(AD_SEL) && !p.hasAttribute('is-promoted') && !p.parentElement?.closest(POST_SEL) && !p.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') && !p.getAttribute('removed-by-category') && p.getAttribute('is-removed') !== 'true' && normAuthor(p.getAttribute(p.matches('shreddit-post') ? 'author' : 'data-author') || '').toLowerCase() === ctx.owner)) return;
+    if ([...document.querySelectorAll(POST_SEL)].some((p) => !isPostRemoved(p) && !p.parentElement?.closest(POST_SEL) && normAuthor(p.getAttribute(p.matches('shreddit-post') ? 'author' : 'data-author') || '').toLowerCase() === ctx.owner)) return;
     const emptyEl = document.querySelector('p#noresults.error, [data-testid="empty-state"], shreddit-empty-state, faceplate-partial[name*="empty"]');
     const textEmpty = /hasn't posted yet|no posts yet|doesn't seem to be anything here|keeps their posts hidden|hidden their posts/.test((document.querySelector('main, [role="main"]')?.textContent || '').toLowerCase());
     if (!emptyEl && !textEmpty) return;
-    if (ctx.sort === 'top') {
-      if (ctx.t && ctx.t !== 'all') return;
-      if (typeof cur?.hasHot === 'boolean') setStatus(ctx.owner, cur.hasHot, false); else { partialTopFalse.add(ctx.owner); syncDom(ctx.owner); }
+    if (ctx.sort === 'top' && (!ctx.t || ctx.t === 'all')) {
+      if (typeof cur?.hasHot === 'boolean') setStatus(ctx.owner, cur.hasHot, false);
+      else { partialTopFalse.add(ctx.owner); syncDom(ctx.owner); }
     } else if (ctx.sort === 'hot' || textEmpty) setStatus(ctx.owner, false, false);
   }
   function createWrap(author, authorId, noAuto) {
@@ -406,8 +406,7 @@
         if (a.dataset.postsState === 'empty') { e.preventDefault(); return; }
         if (e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && /^\/(?:user|u)\/[^/]+(?:\/|$)/i.test(location.pathname)) { e.preventDefault(); location.assign(a.href); }
       };
-      a.addEventListener('click', onNav); a.addEventListener('auxclick', (e) => { if (e.button === 1) onNav(e); });
-      return a;
+      a.addEventListener('click', onNav); a.addEventListener('auxclick', (e) => { if (e.button === 1) onNav(e); }); return a;
     };
     const postsBtn = mkLink('posts', 'Posts', `/user/${enc}/submitted/?sort=hot`), topBtn = mkLink('top', 'Top posts', `/user/${enc}/submitted/?sort=top&t=all`);
     const blockBtn = document.createElement('button');
@@ -449,10 +448,10 @@
       clearTimers(existing); observer.unobserve(post); postToWrap.delete(post); existing.remove();
     }
     if (!author || SKIP_AUTHORS.has(key) || !bar) return;
-    const isRemoved = Boolean(post.querySelector('[slot="post-removed-banner"],[slot="mod-status"]') || post.matches(AD_SEL) || post.hasAttribute('is-promoted') || post.getAttribute('removed-by-category') || post.getAttribute('is-removed') === 'true');
+    const isRemoved = isPostRemoved(post);
     if (isOwnerSubmitted && !isRemoved) {
       if (prof.sort === 'top') setStatus(key, true, true);
-      else if (prof.sort === 'hot') { const cur = authorCache.get(key); if (cur?.expiresAt > Date.now()) setStatus(key, true, cur.hasTop); else { partialHotTrue.add(key); syncDom(key); } }
+      else if (prof.sort === 'hot') { const cur = authorCache.get(key); if (cur?.expiresAt > Date.now()) setStatus(key, true, cur.hasTop); else { partialHotTrue.add(key); syncDom(key); flushCache(false); } }
     }
     const wrap = createWrap(author, authorId, noAuto);
     if (modern) {
@@ -478,7 +477,7 @@
     } else { flushCache(true); document.querySelectorAll(`.${WRAP}`).forEach(clearTimers); }
   });
   window.addEventListener('pagehide', () => flushCache(true));
-  if (typeof chrome !== 'undefined') chrome?.storage?.onChanged?.addListener((c, area) => { if (area === 'local') Object.entries(c).forEach(([k, ch]) => applyExternal(k, ch?.newValue)); });
+  if (typeof chrome !== 'undefined') chrome?.storage?.onChanged?.addListener((c, area) => { if (isExtValid() && area === 'local') Object.entries(c).forEach(([k, ch]) => applyExternal(k, ch?.newValue)); });
   window.addEventListener('storage', (e) => { if (e.key && e.newValue) { try { applyExternal(e.key, JSON.parse(e.newValue)); } catch {} } });
 
   let raf = false;
@@ -492,12 +491,10 @@
   let lastUrl = location.href, navTimer = null;
   const onNav = () => {
     if (location.href === lastUrl) return;
-    lastUrl = location.href; tabReadyAt = Date.now() + CFG.settleMs;
-    if (navTimer) clearTimeout(navTimer);
+    lastUrl = location.href; tabReadyAt = Date.now() + CFG.settleMs; if (navTimer) clearTimeout(navTimer);
     navTimer = setTimeout(() => { navTimer = null; ready.then(seedEmptyProfileIfReady); }, CFG.settleMs);
   };
-  window.addEventListener('popstate', onNav);
-  document.querySelectorAll(POST_SEL).forEach(processPost);
+  window.addEventListener('popstate', onNav); document.querySelectorAll(POST_SEL).forEach(processPost);
   setTimeout(() => ready.then(seedEmptyProfileIfReady), CFG.settleMs);
   if (document.body) {
     new MutationObserver((muts) => {
@@ -510,8 +507,7 @@
       }
       const hasEmpty = muts.some((m) => [...(m.addedNodes || [])].some((n) => n.nodeType === 1 && (n.matches?.('shreddit-empty-state, [data-testid="empty-state"]') || n.querySelector?.('shreddit-empty-state, [data-testid="empty-state"]'))));
       if (hasEmpty) seedEmptyProfileIfReady();
-      if (raf || !pending.size) return;
-      raf = true;
+      if (raf || !pending.size) return; raf = true;
       requestAnimationFrame(() => { raf = false; const list = [...pending]; pending.clear(); list.forEach(processPost); seedEmptyProfileIfReady(); });
     }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['author', 'author-id', 'data-author', 'data-author-fullname'] });
   }
