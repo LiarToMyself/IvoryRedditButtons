@@ -1,24 +1,94 @@
 # IvoryRedditButtons
 
-Lightweight Manifest V3 Chrome extension for Reddit (Shreddit and Old Reddit). Adds three direct action buttons to every post header in feeds, post pages, and user profiles:
+> Быстрое, легковесное расширение Manifest V3 для Reddit, отображающее статус активности авторов и позволяющее блокировать спамеров в один клик прямо из ленты.
 
-- **Posts** - opens `/user/<author>/submitted/?sort=hot` directly, bypassing the mixed Overview tab. Highlights in red (`✕ No posts`) and prevents navigation if the author has no visible hot posts.
-- **Top posts** - opens `/user/<author>/submitted/?sort=top&t=all`. Highlights in red (`✕ No top`) and prevents navigation if the author has no visible top posts.
-- **Block** - blocks the post author in one click directly from the feed without opening their profile.
+![Manifest V3](https://img.shields.io/badge/Manifest-V3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.4.4-brightgreen.svg)
+![Vanilla JS](https://img.shields.io/badge/stack-Vanilla%20JS-yellow.svg)
+![Zero Dependencies](https://img.shields.io/badge/dependencies-none-success.svg)
+![License](https://img.shields.io/badge/license-MIT-purple.svg)
 
-## Key Features in v1.4.4
+---
 
-- **Pre-Click Red Indicators (`✕ No posts` / `✕ No top`)**: Checks author listings before clicking, highlighting empty, removed, or unavailable accounts in red while preserving independent coloring for hot and top listings.
-- **Native Shreddit Partial Transport with Fallback**: On `www.reddit.com`, listing checks query Reddit's internal Shreddit partial endpoint (`/svc/shreddit/profiles/profile_posts-more-posts/`), avoiding rudimentary `.json` bans, exposing real rate-limit headers (>220 requests per window), and filtering removed posts via `DOMParser`. Automatically falls back to `/user/<author>/submitted.json?limit=10` on `old.reddit.com` or unexpected responses.
-- **Burst-Free Pacing & Protected Hover Reserve**: Smooth background spacing (`9.5s` / `14s` / `20s`, `5/min`, `24/10min`) eliminates queue freezes, while a dedicated priority lane (`7/min`, `30/10min`, `1.8s` gap) provides instant hover checks without letting background tasks starve user interactions.
-- **Cross-Tab Quota Ledger & Post-429 Cooldown**: Coordinates rate limits across all Reddit tabs via `chrome.storage.local` and `navigator.locks`. Any `HTTP 429` triggers an immediate pause of at least 600 seconds and persists a 30-minute `slowUntil` flag, cutting request rates in half across all open and new tabs.
-- **Zero-Request Profile Seeding & Safe Nested Crossposts**: On `/user/<owner>/submitted/`, all three buttons remain active, while the profile owner's status is seeded passively from DOM for zero network requests. Nested crossposts are verified on demand upon hover.
-- **Reliable 1-Click Block**: Uses browser CSRF cookies and DOM tokens directly, avoiding redundant `/api/me.json` calls, checking rate limits prior to recording timestamps, and logging all Block network calls in the shared quota ledger.
+## О проекте
 
-## Installation
+IvoryRedditButtons встраивает компактные кнопки действий в шапку каждого поста в лентах Reddit, на страницах постов и в профилях пользователей:
 
-1. Clone or download this repository.
-2. Open `chrome://extensions/` in Google Chrome.
-3. Enable **Developer mode** (top-right toggle).
-4. Click **Load unpacked** and select the repository folder.
-5. Reload open Reddit tabs.
+- **Posts** - мгновенный переход к `/user/<author>/submitted/?sort=hot` в обход смешанной вкладки обзора. Если у автора нет публикаций, кнопка заранее окрашивается в красный цвет (`✕ No posts`) и предотвращает бесполезный клик.
+- **Top posts** - переход к лучшим публикациям за все время `/user/<author>/submitted/?sort=top&t=all`. При отсутствии постов окрашивается в красный (`✕ No top`).
+- **Block** - мгновенная блокировка автора в один клик без перехода в профиль и перезагрузки страницы.
+
+---
+
+## Ключевые возможности версии 1.4.4
+
+### 1. Защита от блокировок Reddit (HTTP 429)
+- Использование внутреннего частичного эндпоинта Shreddit (`/svc/shreddit/profiles/profile_posts-more-posts/`) вместо тяжелых `.json` запросов.
+- Защита от исчерпания лимитов: расширение отслеживает заголовки `X-Ratelimit-Remaining` и автоматически замедляет темп при приближении к пороговым значениям.
+- Интеллектуальный откат: при получении 429 все вкладки переходят в защитный режим с паузой и снижением частоты опроса в два раза.
+
+### 2. Двухшаговый каскад Top -> Hot
+- Проверка автора начинается с лучших постов (`Top posts`). Если у автора есть топовые публикации, статус подтверждается за 1 запрос.
+- Если топовых публикаций нет, мгновенно запускается второй шаг проверки (`Hot posts`) со связной задержкой 1.8с в фоне и 200мс при наведении курсора.
+- Обе кнопки окрашиваются менее чем за 900мс при реальном взаимодействии с карточкой.
+
+### 3. Изолированный приоритетный коридор для наведения (Hover)
+- Проверка автора по наведению курсора мыши больше не ждет своей очереди за фоновыми задачами ленты.
+- Выделенная квота гарантирует мгновенную подкраску кнопок именно там, куда направлено внимание пользователя.
+
+### 4. Нулевая нагрузка на страницах профилей
+- При открытии постов пользователя `/user/<owner>/submitted/` статус владельца считывается напрямую из разметки страницы без единого сетевого запроса.
+- Модераторские баннеры удаленных постов автоматически фильтруются, предотвращая ложные зеленые статусы.
+
+### 5. Межвкладочная синхронизация через Storage и Web Locks
+- Статусы авторов и сетевые квоты синхронизируются между всеми открытыми вкладками браузера через `chrome.storage.local`.
+- Кэш сохраняет статус авторов с постами на 24 часа, а пустых профилей - на 4 часа.
+
+### 6. Чистая архитектура и вынос стилей
+- Монолитный скрипт сокращен более чем вдвое (с 1129 до 514 строк).
+- Стили вынесены в отдельный файл `styles.css` (109 строк) в строгом соответствии с политикой безопасности Chrome Manifest V3.
+
+---
+
+## Архитектура проекта
+
+Движок функционирует автономно внутри контекста страницы без фонового Service Worker:
+
+- `manifest.json` - манифест расширения Manifest V3 с декларацией скрипта и таблицы стилей.
+- `content.js` - ядро расширения: очередь запросов, каскадный парсер данных, координация лимитов и обработчики событий DOM.
+- `styles.css` - внешние стили для кнопок, плавной анимации состояний и индикаторов загрузки.
+- `EngineBlueprint.md` - полная спецификация архитектуры каждого функционального слоя, алгоритмов скоринга и сетевых формул.
+- `CHANGELOG.md` - подробная история версий и изменений.
+
+---
+
+## Установка и запуск
+
+1. Склонируйте или скачайте данный репозиторий:
+   ```bash
+   git clone https://github.com/LiarToMyself/IvoryRedditButtons.git
+   ```
+2. Откройте страницу расширений в Chrome:
+   ```text
+   chrome://extensions/
+   ```
+3. Включите **Режим разработчика** (Developer mode) в правом верхнем углу страницы.
+4. Нажмите кнопку **Загрузить распакованное расширение** (Load unpacked).
+5. Выберите папку с репозиторием проекта.
+6. Перезагрузите активные вкладки Reddit.
+
+---
+
+## Цветовая индикация кнопок
+
+- **Серый нейтральный** - проверка не проводилась либо автор находится в очереди опроса.
+- **Темно-зеленый** - наличие постов в соответствующей категории подтверждено.
+- **Темно-красный** - публикации в категории отсутствуют (клик блокируется во избежание пустых переходов).
+- **Синий на кнопке Block** - выполняется запрос на блокировку пользователя через API Reddit.
+- **Темно-серый на кнопке Block** - пользователь успешно добавлен в персональный черный список.
+
+---
+
+## Лицензия
+
+Проект распространяется под открытой лицензией MIT.
