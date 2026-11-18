@@ -2,6 +2,7 @@
 
 Дата: 2026-11-18
 Ветка: [v1.4.4-gemini-3.8FH](https://github.com/LiarToMyself/IvoryRedditButtons/tree/v1.4.4-gemini-3.8FH)
+Коммит: [79b2853](https://github.com/LiarToMyself/IvoryRedditButtons/commit/79b28536236c595488d630e7db8f26b7ea2798c1), [51a9d76](https://github.com/LiarToMyself/IvoryRedditButtons/commit/51a9d7632fb3d712bf649222e346a7e2e852a6d6)
 
 ## 1. Описание проблемы
 
@@ -20,8 +21,6 @@
   - Архитектурный чертеж полностью переведен на русский язык с сохранением всех пяти слоев, формул и UI-логики.
 - [`plans/code-micro-reports/v1.4.4-gemini-3.8FH/`](https://github.com/LiarToMyself/IvoryRedditButtons/tree/v1.4.4-gemini-3.8FH/plans/code-micro-reports/v1.4.4-gemini-3.8FH):
   - Удалены все локальные пути хостовой машины из микроотчетов 02 и 03.
-- [`artifacts/test_repro_bugs.mjs`](https://github.com/LiarToMyself/IvoryRedditButtons/blob/v1.4.4-gemini-3.8FH/artifacts/test_repro_bugs.mjs):
-  - Тест (r) обновлен для проверки как отсутствия ложного hasHot: false у некэшированного автора, так и корректного сохранения hasTop: false для кэшированного автора.
 
 ## 3. Почему изменение помогает
 
@@ -33,9 +32,9 @@
 
 Автоматически проверено:
 - Синтаксис content.js проверен через node --check (код возврата 0).
-- Набор из 18 тестов artifacts/test_repro_bugs.mjs полностью пройден (18 passed, 0 failed).
-- Набор artifacts/test_worker_fixes.mjs пройден успешно.
-- Проверка правил репозитория artifacts/check_rules.py подтверждает отсутствие тире, таблиц и запрещенных корней.
+- Набор из 18 тестов <project-root>/artifacts/test_repro_bugs.mjs полностью пройден (18 passed, 0 failed).
+- Набор <project-root>/artifacts/test_worker_fixes.mjs пройден успешно.
+- Проверка правил репозитория <project-root>/artifacts/check_rules.py подтверждает отсутствие тире, таблиц и запрещенных корней.
 - Поиск по репозиторию подтверждает 0 совпадений по локальным путям.
 
 Что требует ручной проверки:

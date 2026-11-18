@@ -88,8 +88,9 @@ IvoryRedditButtons - браузерное расширение Manifest V3 дл�
 
 Если учетная запись заблокирована или удалена, шлюз фрагментов Reddit возвращает HTTP 200 OK со специфичным текстом:
 
-- Регулярное выражение: MISSING_USER_RE = /nobody on reddit goes by that name|account has been suspended/i
+- Регулярное выражение: MISSING_USER_RE = /Sorry,\s+nobody on Reddit goes by that name\.|This account has been suspended/i
 - Логика: При совпадении с текстом ответа транспорт выбрасывает ошибку с флагами settledEmpty = true и status = 404.
+- Валидация перенаправлений: при наличии флага res.redirected проверяется совпадение origin и допустимый путь по регулярному выражению /^\/(?:(?:user|u)\/[^/]+\/(?:submitted|about)\.json|api\/me\.json|svc\/shreddit\/profiles\/profile_posts-more-posts\/(?:top|hot)\/?)$/i
 - Результат: Уровень 3 перехватывает эту ошибку и сразу вызывает setStatus(author, false, false). Обе кнопки Posts и Top posts становятся красными за один HTTP запрос без запуска шага 2.
 
 ### 2.3 Резервный транспорт JSON
@@ -145,8 +146,8 @@ IvoryRedditButtons - браузерное расширение Manifest V3 дл�
    - Иначе если isStep2: until = max(limitedUntil, max(pausedUntil, lastReqAt + 1800 * scale))
    - Иначе: until = max(limitedUntil, max(pausedUntil, tabReadyAt, nextBgAt))
 4. Ограничения квоты:
-   - maxMin = (isPri || isStep2) ? (slow ? 4 : 7) : (slow ? 3 : 5)
-   - max10m = (isPri || isStep2) ? (slow ? 16 : 30) : (slow ? 12 : 24)
+   - maxMin: для быстрой связки наведения (isPri && isStep2) равен (slow ? 5 : 8) (CFG.totalMaxPerMin + 1, выделяя дополнительный слот без задержки); для одиночного приоритета isPri равен (slow ? 4 : 7) (CFG.totalMaxPerMin); для фонового второго шага isStep2 равен (slow ? 3 : 6) (CFG.totalMaxPerMin - 1, резервируя 7-й слот под наведение); для фонового первого шага равен (slow ? 3 : 5) (CFG.bgMaxPerMin).
+   - max10m: для приоритета isPri равен (slow ? 16 : 30) (CFG.totalMaxPer10Min); для фоновых запросов (включая фоновый второй шаг) равен (slow ? 12 : 24) (CFG.bgMaxPer10Min, резервируя 6 слотов в 10-минутном окне под наведение).
 5. Проверка бюджета в скользящем окне:
    - Если число меток за 60 секунд >= maxMin: until = max(until, самая_старая_в_окне + 60050)
    - Если число меток за 10 минут >= max10m: until = max(until, самая_старая_в_окне + 600050)
@@ -259,9 +260,8 @@ IvoryRedditButtons - браузерное расширение Manifest V3 дл�
 
 ---
 
-## Матрица проверки качества
+## Матрица технической проверки движка
 
-- Проверка синтаксиса: node --check content.js (код возврата 0).
-- Набор алгоритмических тестов: node artifacts/test_repro_bugs.mjs (18 пройдено, 0 ошибок).
-- Проверка рабочих сценариев: node artifacts/test_worker_fixes.mjs (все проверки пройдены).
-- Проверка правил репозитория: python artifacts/check_rules.py (0 длинных тире, 0 таблиц, 0 лести).
+- Проверка синтаксиса JavaScript: node --check content.js (код возврата 0).
+- Регрессионный набор тестов: 18 тестов воспроизведения ключевых дефектов (алгоритмы blockedUntil, слияние кэша, защита шага 2 от скролла, DOMParser).
+- Проверка сценариев очередей: верификация интервалов Step 2 (200 мс по наведению), бюджетов квот и регулярных выражений маршрутов.

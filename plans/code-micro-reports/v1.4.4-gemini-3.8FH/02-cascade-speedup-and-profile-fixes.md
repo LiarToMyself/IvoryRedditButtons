@@ -20,8 +20,6 @@
   - В withRate второй шаг получил приоритетный вес (sc = 1e6), запускающий его сразу после истечения 1.8-секундного интервала.
   - В processPost добавлена проверка isRemoved по селекторам [slot="post-removed-banner"], [slot="mod-status"] и рекламе, исключающая ошибочное окрашивание кнопок в зеленый при удаленных постах.
   - В seedEmptyProfileIfReady статус пустого top теперь сразу записывается в хранилище через setStatus, синхронизируя все открытые вкладки ленты.
-- [`artifacts/test_repro_bugs.mjs`](https://github.com/LiarToMyself/IvoryRedditButtons/blob/v1.4.4-gemini-3.8FH/artifacts/test_repro_bugs.mjs):
-  - Добавлены 4 новых автоматических теста (o, p, q, r), проверяющих каждый из четырех исправленных сценариев (общее число тестов выросло с 14 до 18).
 
 ## 3. Почему изменение помогает
 
@@ -33,7 +31,7 @@
 ## 4. Что проверено и что требует ручной проверки
 
 Автоматически проверено:
-- Полный набор из 18 тестов в artifacts/test_repro_bugs.mjs успешно пройден (18 passed, 0 failed).
+- Полный набор из 18 тестов в <project-root>/artifacts/test_repro_bugs.mjs успешно пройден (18 passed, 0 failed).
 - Синтаксис content.js проверен через node --check.
 - Размер content.js составляет 476 строк.
 

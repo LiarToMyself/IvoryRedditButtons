@@ -171,7 +171,7 @@ After every session where the agent did something wrong:
 - Hook setup: `git config core.hooksPath .githooks`
 
 ### Layout
-- Source lives in: `./` (`manifest.json`, `content.js`)
+- Source lives in: `./` (`manifest.json`, `content.js`, `styles.css`)
 - Assets live in: `assets/`
 - Screenshots live in: `screenshots/`
 - Documentation: `README.md`, `EngineBlueprint.md` (layer design and exact logic), `CHANGELOG.md` (version history read by release workflow), `plans/` (plans and checklists).

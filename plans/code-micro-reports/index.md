@@ -5,3 +5,4 @@
 - [02-cascade-speedup-and-profile-fixes.md](v1.4.4-gemini-3.8FH/02-cascade-speedup-and-profile-fixes.md) - Chained 1.8s Step-2 hot, scroll resilience, removed post filter, and profile top status sync (2026-11-18)
 - [03-hover-fast-chain-and-profile-matching.md](v1.4.4-gemini-3.8FH/03-hover-fast-chain-and-profile-matching.md) - Fast-chain Step 2 on hover, Step 2 quota, profile matching, and empty profile seeding (2026-11-18)
 - [04-feed-pacing-false-red-fix-and-russian-blueprint.md](v1.4.4-gemini-3.8FH/04-feed-pacing-false-red-fix-and-russian-blueprint.md) - Stepped 4.5s feed pacing, elimination of false red on Posts, and Russian EngineBlueprint (2026-11-18)
+- [05-edge-case-hardening-and-hover-quota-protection.md](v1.4.4-gemini-3.8FH/05-edge-case-hardening-and-hover-quota-protection.md) - Edge case hardening, syncDom on hot, removed-by-category, hover quota protection, and SPA settleMs debounce (2026-11-18)

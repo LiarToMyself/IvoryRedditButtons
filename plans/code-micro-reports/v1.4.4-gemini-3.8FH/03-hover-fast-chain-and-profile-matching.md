@@ -2,7 +2,7 @@
 
 Дата: 2026-11-18
 Ветка: [v1.4.4-gemini-3.8FH](https://github.com/LiarToMyself/IvoryRedditButtons/tree/v1.4.4-gemini-3.8FH)
-Коммит: рабочий каталог (Worker 1)
+Коммит: [79b2853](https://github.com/LiarToMyself/IvoryRedditButtons/commit/79b28536236c595488d630e7db8f26b7ea2798c1)
 
 ## 1. Обнаруженные проблемы
 
@@ -21,8 +21,6 @@
   - В seedEmptyProfileIfReady при совпадении textEmpty выставляется setStatus(false, false); на sort=top исключена запись hasHot: null.
 - [`EngineBlueprint.md`](https://github.com/LiarToMyself/IvoryRedditButtons/blob/v1.4.4-gemini-3.8FH/EngineBlueprint.md):
   - Создан детальный архитектурный документ, описывающий все 5 слоев, формулы расписания, UI-дизайн и алгоритмы без дублирования правил AGENTS.md.
-- [`artifacts/test_worker_fixes.mjs`](https://github.com/LiarToMyself/IvoryRedditButtons/blob/v1.4.4-gemini-3.8FH/artifacts/test_worker_fixes.mjs):
-  - Создан специализированный скрипт верификации всех четырех исправлений.
 
 ## 3. Почему изменение помогает
 
@@ -35,9 +33,9 @@
 
 Автоматически проверено:
 - Синтаксис content.js проверен через node --check (код 0).
-- Полный набор тестов artifacts/test_repro_bugs.mjs успешно пройден (18 passed, 0 failed).
-- Набор проверок artifacts/test_worker_fixes.mjs успешно пройден.
-- Правила репозитория проверены через artifacts/check_rules.py (0 em-dash, 0 таблиц, 0 запрещенных слов).
+- Полный набор тестов <project-root>/artifacts/test_repro_bugs.mjs успешно пройден (18 passed, 0 failed).
+- Набор проверок <project-root>/artifacts/test_worker_fixes.mjs успешно пройден.
+- Правила репозитория проверены через <project-root>/artifacts/check_rules.py (0 em-dash, 0 таблиц, 0 запрещенных слов).
 
 Что требует ручной проверки:
 - Проверка в Chrome DevTools на живой странице Reddit: время покраснения кнопки Posts при наведении курсора на карточку пустого автора.
