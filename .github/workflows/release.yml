@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag or version'
+        required: false
+        default: 'v1.4.4'
+        type: string
+      dry_run:
+        description: 'Dry run without publishing to GitHub Releases'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    name: Publish Extension Release
+    runs-on: windows-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Release Notes & Build Package
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          $content = "IvoryRedditButtons Release $tag"
+          if (Test-Path "CHANGELOG.md") {
+              $lines = Get-Content "CHANGELOG.md"
+              $recording = $false
+              $extracted = @()
+              foreach ($line in $lines) {
+                  if ($line -match "^## \[$([regex]::Escape($tag))\]" -or $line -match "^## \[$([regex]::Escape($tag.TrimStart('v')))") {
+                      $recording = $true
+                      continue
+                  }
+                  if ($recording) {
+                      if ($line -match "^## \[") {
+                          break
+                      }
+                      $extracted += $line
+                  }
+              }
+              if ($extracted.Count -gt 0) {
+                  $content = ($extracted -join "`n").Trim()
+              }
+          } else {
+              $versionClean = $tag.TrimStart('v')
+              $planFile = Get-ChildItem -Path "plans" -Filter "*$versionClean*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($planFile) {
+                  $content = (Get-Content $planFile.FullName -Raw).Trim()
+              }
+          }
+          Set-Content -Path "release-notes.md" -Value $content -Encoding utf8
+
+          $zipName = "IvoryRedditButtons-$tag.zip"
+          Compress-Archive -Path "manifest.json", "content.js", "styles.css", "icon.png", "assets", "README.md" -DestinationPath $zipName -Force
+
+      - name: Log Release Notes & Package (Dry Run)
+        if: ${{ inputs.dry_run == true || github.event.inputs.dry_run == 'true' }}
+        shell: pwsh
+        run: |
+          Write-Host "=== [DRY RUN] Release Notes (release-notes.md) ==="
+          if (Test-Path "release-notes.md") {
+              Get-Content "release-notes.md"
+          }
+          Write-Host ""
+          Write-Host "=== [DRY RUN] Release Assets ==="
+          Get-ChildItem -Filter "IvoryRedditButtons-*.zip" | ForEach-Object {
+              Write-Host "--- $($_.Name) ($($_.Length) bytes) ---"
+          }
+          Write-Host "=== [DRY RUN] Skipping GitHub Release creation ==="
+
+      - name: Create GitHub Release
+        if: ${{ inputs.dry_run != true && github.event.inputs.dry_run != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: IvoryRedditButtons-*.zip
+          body_path: release-notes.md
+          generate_release_notes: false
+          draft: false
+          prerelease: false

@@ -1,0 +1,109 @@
+.author-btns-wrap {
+  position: relative;
+  z-index: 10;
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 5px;
+  margin-left: auto;
+  margin-right: 6px;
+  flex-shrink: 0;
+}
+
+.irb-btn {
+  position: relative;
+  z-index: 10;
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 26px;
+  min-height: 26px;
+  max-height: 26px;
+  min-width: 0;
+  appearance: none;
+  vertical-align: middle;
+  gap: 5px;
+  margin: 0;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  font-family: inherit;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, opacity 0.15s;
+  background: #272729;
+  color: #d7dadc;
+  border: 1px solid #343536;
+}
+
+.irb-btn:hover:not(:disabled) {
+  background: #343536;
+}
+
+.irb-btn.irb-empty,
+.irb-btn.irb-err {
+  background: #3b1d20;
+  color: #f5b7b1;
+  border-color: #6e2c33;
+}
+
+.irb-btn.irb-empty:hover:not(:disabled),
+.irb-btn.irb-err:hover:not(:disabled) {
+  background: #4f262a;
+}
+
+.irb-btn.irb-block {
+  background: #33241b;
+  color: #f5cba7;
+  border-color: #5c3d2e;
+}
+
+.irb-btn.irb-block:hover:not(:disabled) {
+  background: #473022;
+}
+
+.irb-btn.irb-blocked {
+  background: #1b2e22;
+  color: #82e0aa;
+  border-color: #2e523b;
+  cursor: default;
+}
+
+.irb-btn.irb-wait {
+  cursor: wait;
+}
+
+.irb-btn.irb-locked {
+  cursor: not-allowed;
+}
+
+.irb-badge {
+  display: inline-block;
+  padding: 1px 5px;
+  background: #6e2c33;
+  color: #ffd7d5;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 13px;
+}
+
+.irb-bar {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  row-gap: 4px !important;
+  padding-top: 6px !important;
+}
+
+.irb-dimmed {
+  opacity: 0.35 !important;
+}
