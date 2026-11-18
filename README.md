@@ -1,6 +1,6 @@
 # IvoryRedditButtons
 
-> Быстрое, легковесное расширение Manifest V3 для Reddit, отображающее статус активности авторов и позволяющее блокировать спамеров в один клик прямо из ленты.
+> Расширение Manifest V3 для Reddit, отображающее статус активности авторов (наличие постов и лучших публикаций) и позволяющее блокировать авторов в один клик прямо из ленты.
 
 ![Manifest V3](https://img.shields.io/badge/Manifest-V3-blue.svg)
 ![Version](https://img.shields.io/badge/version-1.4.4-brightgreen.svg)
