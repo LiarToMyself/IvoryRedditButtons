@@ -6,4 +6,3 @@
 - [03-hover-fast-chain-and-profile-matching.md](v1.4.4-gemini-3.8FH/03-hover-fast-chain-and-profile-matching.md) - Fast-chain Step 2 on hover, Step 2 quota, profile matching, and empty profile seeding (2026-11-18)
 - [04-feed-pacing-false-red-fix-and-russian-blueprint.md](v1.4.4-gemini-3.8FH/04-feed-pacing-false-red-fix-and-russian-blueprint.md) - Stepped 4.5s feed pacing, elimination of false red on Posts, and Russian EngineBlueprint (2026-11-18)
 - [05-argon-audit-refinements-and-doc-sync.md](v1.4.4-gemini-3.8FH/05-argon-audit-refinements-and-doc-sync.md) - Audit refinements, step2 retryAfter recovery, hover quota protection, and doc sync (2026-11-18)
-- [06-russian-blueprint-readme-changelog-and-pr-prep.md](v1.4.4-gemini-3.8FH/06-russian-blueprint-readme-changelog-and-pr-prep.md) - Russian blueprint rewrite, creative readme, changelog update, and PR preparation (2026-11-19)
