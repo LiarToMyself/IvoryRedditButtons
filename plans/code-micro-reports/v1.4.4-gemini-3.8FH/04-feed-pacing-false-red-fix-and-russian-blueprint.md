@@ -2,7 +2,7 @@
 
 Дата: 2026-11-18
 Ветка: [v1.4.4-gemini-3.8FH](https://github.com/LiarToMyself/IvoryRedditButtons/tree/v1.4.4-gemini-3.8FH)
-Коммит: [79b2853](https://github.com/LiarToMyself/IvoryRedditButtons/commit/79b28536236c595488d630e7db8f26b7ea2798c1), [51a9d76](https://github.com/LiarToMyself/IvoryRedditButtons/commit/51a9d7632fb3d712bf649222e346a7e2e852a6d6)
+Коммит: [5c8985b](https://github.com/LiarToMyself/IvoryRedditButtons/commit/5c8985b)
 
 ## 1. Описание проблемы
 
@@ -32,9 +32,9 @@
 
 Автоматически проверено:
 - Синтаксис content.js проверен через node --check (код возврата 0).
-- Набор из 18 тестов <project-root>/artifacts/test_repro_bugs.mjs полностью пройден (18 passed, 0 failed).
-- Набор <project-root>/artifacts/test_worker_fixes.mjs пройден успешно.
-- Проверка правил репозитория <project-root>/artifacts/check_rules.py подтверждает отсутствие тире, таблиц и запрещенных корней.
+- Набор из 18 тестов полностью пройден (18 passed, 0 failed).
+- Набор проверок пройден успешно.
+- Проверка правил репозитория подтверждает отсутствие тире, таблиц и запрещенных корней.
 - Поиск по репозиторию подтверждает 0 совпадений по локальным путям.
 
 Что требует ручной проверки:
