@@ -1,17 +1,70 @@
-node_modules/
-.DS_Store
-Thumbs.db
-*.log
-*.zip
-*.crx
-*.pem
-.idea/
-.vscode/
-
-artifacts/
-
-# Environments and secrets
+# Secrets and environments
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
 
+# Build outputs, artifacts, extensions, and logs
+artifacts/
+logs/
+build/
+dist/
+**/bin/
+**/obj/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.pdb
+*.test
+*.log
+*.crx
+coverage/
+coverage.out
+coverage.html
+
+# Archives and backups
+*.tar
+*.zip
+*.7z
+*.gz
+*.rar
+*.bak
+
+# Assets and screenshots
+assets/
+screenshots/
+
+# Dependencies and virtual environments
+node_modules/
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Databases and data
+*.sqlite
+*.db
+data/
+
+# OS, editors, and IDE junk
+.vscode/
+.vs/
+.idea/
+.gemini/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.suo
+*.user
+*.swp
+*.tmp

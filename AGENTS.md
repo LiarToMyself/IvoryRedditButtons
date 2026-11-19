@@ -167,7 +167,7 @@ After every session where the agent did something wrong:
 - Release tag: `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
 - Push tag: `git push origin vX.Y.Z`
 - Backup: `powershell -NoProfile -ExecutionPolicy Bypass -Command '$d = "<backup-dir>"; if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force }; $n = Join-Path $d ("IvoryRedditButtons_" + (Get-Date -Format "yyyy-MM-dd_HH-mm") + ".tar"); $i = (Get-ChildItem -Force | Where-Object { $_.Name -notin @("artifacts","logs",".git",".vscode") } | ForEach-Object { $_.Name }); tar -cf $n @i'`
-- Backup codebase: `powershell -NoProfile -ExecutionPolicy Bypass -Command '$d = "<backup-dir>"; if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force }; $n = Join-Path $d ("IvoryRedditButtons_Codebase_" + (Get-Date -Format "yyyy-MM-dd_HH-mm") + ".tar"); tar -cf $n manifest.json content.js'`
+- Backup codebase: `powershell -NoProfile -ExecutionPolicy Bypass -Command '$d = "<backup-dir>"; if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force }; $n = Join-Path $d ("IvoryRedditButtons_Codebase_" + (Get-Date -Format "yyyy-MM-dd_HH-mm") + ".tar"); tar -cf $n AGENTS.md CHANGELOG.md EngineBlueprint.md README.md content.js icon.png manifest.json styles.css plans'`
 - Hook setup: `git config core.hooksPath .githooks`
 
 ### Layout

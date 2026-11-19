@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag or version'
+        description: 'Release tag or version (defaults to version from branch/ref)'
         required: false
-        default: 'v1.4.4'
+        default: ''
         type: string
       dry_run:
         description: 'Dry run without publishing to GitHub Releases'
@@ -38,8 +38,12 @@ jobs:
           INPUT_TAG: ${{ github.event.inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          $rawRef = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          $tag = if ($rawRef -match '(v\d+\.\d+\.\d+)') { $matches[1] } else { $rawRef }
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
           $content = "IvoryRedditButtons Release $tag"
+          $foundInChangelog = $false
           if (Test-Path "CHANGELOG.md") {
               $lines = Get-Content "CHANGELOG.md"
               $recording = $false
@@ -56,25 +60,34 @@ jobs:
                       $extracted += $line
                   }
               }
-              if ($extracted.Count -gt 0) {
+              if ($extracted.Count -gt 0 -and ($extracted -join "`n").Trim().Length -gt 0) {
                   $content = ($extracted -join "`n").Trim()
+                  $foundInChangelog = $true
               }
-          } else {
-              $versionClean = $tag.TrimStart('v')
-              $planFile = Get-ChildItem -Path "plans" -Filter "*$versionClean*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($planFile) {
-                  $content = (Get-Content $planFile.FullName -Raw).Trim()
+          }
+          if (-not $foundInChangelog) {
+              if (Test-Path "README.md") {
+                  $readme = Get-Content "README.md" -Raw
+                  if ($readme -match '(?ms)^#\s+[^\r\n]+\s*\r?\n\s*>\s*(.*?)(?:\r?\n\r?\n|$)') {
+                      $summary = ($matches[1] -replace '\r?\n', ' ').Trim()
+                      $content = "IvoryRedditButtons $tag`n`n$summary"
+                  } else {
+                      $content = "IvoryRedditButtons Release $tag"
+                  }
+              } else {
+                  $content = "IvoryRedditButtons Release $tag"
               }
           }
           Set-Content -Path "release-notes.md" -Value $content -Encoding utf8
 
           $zipName = "IvoryRedditButtons-$tag.zip"
-          Compress-Archive -Path "manifest.json", "content.js", "styles.css", "icon.png", "assets", "README.md" -DestinationPath $zipName -Force
+          Compress-Archive -Path "manifest.json", "content.js", "styles.css", "icon.png", "README.md" -DestinationPath $zipName -Force
 
       - name: Log Release Notes & Package (Dry Run)
         if: ${{ inputs.dry_run == true || github.event.inputs.dry_run == 'true' }}
         shell: pwsh
         run: |
+          Write-Host "=== [DRY RUN] Release Tag: $env:RELEASE_TAG ==="
           Write-Host "=== [DRY RUN] Release Notes (release-notes.md) ==="
           if (Test-Path "release-notes.md") {
               Get-Content "release-notes.md"
@@ -90,7 +103,7 @@ jobs:
         if: ${{ inputs.dry_run != true && github.event.inputs.dry_run != 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: IvoryRedditButtons-*.zip
           body_path: release-notes.md
           generate_release_notes: false
